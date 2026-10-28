@@ -34,6 +34,27 @@ AXXIUM_ISSUER = "https://axxium.promethean.rest/oidc"
 PUBLIC_BASE = "https://knoxx.promethean.rest/colab"
 SCOPES = ["openid", "profile"]
 CHATGPT_REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
+
+
+@dataclass(frozen=True)
+class AuthProfile:
+    issuer: str
+    base_url: str
+    client_id: str
+    default_redirects: tuple[str, ...]
+
+
+PRODUCTION = AuthProfile(AXXIUM_ISSUER, PUBLIC_BASE, "knoxx-colab", (CHATGPT_REDIRECT,))
+STAGING = AuthProfile("https://staging.axxium.promethean.rest/oidc",
+                      "http://127.0.0.1:18761", "knoxx-colab-staging", ())
+
+
+def auth_profile(name):
+    """Select only a compiled-in environment, never an operator supplied issuer."""
+    profiles = {"production": PRODUCTION, "staging": STAGING}
+    if name not in profiles:
+        raise ValueError("Unknown Colab authentication profile")
+    return profiles[name]
 UNAVAILABLE = "Axxium sign-in is not available for Knoxx Colab yet. No access was granted."
 
 
@@ -74,7 +95,8 @@ class IdentityUnavailable(AuthProvider):
         paths = ["/authorize", "/consent", "/register", "/token", "/revoke", "/auth/callback",
                  "/.well-known/oauth-authorization-server",
                  "/.well-known/oauth-authorization-server" + urlsplit(str(self.base_url)).path]
-        return routes + [Route(path, self.unavailable, methods=["GET", "POST", "OPTIONS"]) for path in paths]
+        return routes + [Route(path, self.unavailable, methods=["GET", "POST", "OPTIONS"])
+                         for path in dict.fromkeys(paths)]
 
 
 @dataclass(frozen=True)
@@ -85,12 +107,12 @@ class AxxiumClient:
     allowed_client_redirect_uris: tuple[str, ...] = (CHATGPT_REDIRECT,)
 
     @classmethod
-    def read(cls, path: Path):
+    def read(cls, path: Path, profile=PRODUCTION):
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
             raise ValueError("Axxium client configuration must be a regular private 0600 file")
         data = json.loads(path.read_text())
-        if data.get("issuer") != AXXIUM_ISSUER or data.get("client_id") != "knoxx-colab":
+        if data.get("issuer") != profile.issuer or data.get("client_id") != profile.client_id:
             raise ValueError("Axxium issuer and registered Colab client must match")
         secret = data.get("client_secret", "")
         if not isinstance(secret, str) or len(secret) < 32:
@@ -104,7 +126,7 @@ class AxxiumClient:
         extra_redirects = data.get("allowed_client_redirect_uris", [])
         if not isinstance(extra_redirects, list) or len(extra_redirects) > 16:
             raise ValueError("Client redirect allowlist must contain at most 16 exact URIs")
-        redirects = [CHATGPT_REDIRECT]
+        redirects = list(profile.default_redirects)
         for value in extra_redirects:
             if not isinstance(value, str) or not value or len(value) > 2048 or any(c in value for c in "*?#[%\\"):
                 raise ValueError("Invalid client redirect URI")
@@ -122,19 +144,21 @@ class AxxiumClient:
             if str(uri) in redirects:
                 raise ValueError("Duplicate client redirect URI")
             redirects.append(str(uri))
+        if not redirects:
+            raise ValueError("At least one exact client callback is required")
         return cls(data["client_id"], secret, frozenset(subjects), tuple(redirects))
 
 
-def validate_discovery(data):
+def validate_discovery(data, profile=PRODUCTION):
     """Constrain destinations before sending the confidential client secret."""
-    if data.get("issuer") != AXXIUM_ISSUER:
+    if data.get("issuer") != profile.issuer:
         raise ValueError("Unexpected Axxium issuer")
     for name in ("authorization_endpoint", "token_endpoint", "introspection_endpoint", "revocation_endpoint", "jwks_uri"):
         value = data.get(name)
         if not isinstance(value, str):
             raise ValueError("Incomplete Axxium discovery")
         uri = urlsplit(value)
-        if (uri.scheme != "https" or uri.netloc != "axxium.promethean.rest" or
+        if (uri.scheme != "https" or uri.netloc != urlsplit(profile.issuer).netloc or
                 not uri.path.startswith("/oidc/") or uri.query or uri.fragment or "/../" in uri.path or "%" in uri.path):
             raise ValueError("Axxium endpoint escaped its pinned issuer")
     if "S256" not in data.get("code_challenge_methods_supported", []):
@@ -147,9 +171,9 @@ def validate_discovery(data):
 class AxxiumTokenVerifier(TokenVerifier):
     """Check the current central grant on every request; no local actor fallback."""
 
-    def __init__(self, config, endpoint, transport=None):
+    def __init__(self, config, endpoint, transport=None, profile=PRODUCTION):
         super().__init__(required_scopes=SCOPES)
-        self.config, self.endpoint, self.transport = config, endpoint, transport
+        self.config, self.endpoint, self.transport, self.profile = config, endpoint, transport, profile
 
     async def verify_token(self, token):
         try:
@@ -164,14 +188,14 @@ class AxxiumTokenVerifier(TokenVerifier):
                     data.get("sub") not in self.config.allowed_subjects or
                     isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or
                     not math.isfinite(expiry) or expiry <= time.time() or
-                    not set(SCOPES).issubset(scopes) or data.get("iss", AXXIUM_ISSUER) != AXXIUM_ISSUER):
+                    not set(SCOPES).issubset(scopes) or data.get("iss", self.profile.issuer) != self.profile.issuer):
                 return None
             audience = data.get("aud")
             if audience is not None and audience not in (self.config.client_id, [self.config.client_id]):
                 return None
             return AccessToken(token=token, client_id=self.config.client_id, scopes=scopes,
-                               expires_at=int(expiry), subject=data["sub"], resource=PUBLIC_BASE + "/mcp",
-                               claims={"sub": data["sub"], "iss": AXXIUM_ISSUER})
+                               expires_at=int(expiry), subject=data["sub"], resource=self.profile.base_url + "/mcp",
+                               claims={"sub": data["sub"], "iss": self.profile.issuer})
         except (httpx.HTTPError, ValueError, TypeError, AttributeError):
             return None
 
@@ -256,29 +280,33 @@ class AxxiumOAuthProxy(OAuthProxy):
         routes.append(Route("/revoke", cors_middleware(self.revoke_request, ["POST", "OPTIONS"]), methods=["POST", "OPTIONS"]))
         handler = ResourceTokenHandler(self, ClientAuthenticator(self))
         routes.append(Route("/token", cors_middleware(handler.handle, ["POST", "OPTIONS"]), methods=["POST", "OPTIONS"]))
-        routes.append(Route("/.well-known/oauth-authorization-server" + urlsplit(str(self.base_url)).path,
-                            metadata.endpoint, methods=["GET", "OPTIONS"]))
+        base_path = urlsplit(str(self.base_url)).path
+        if base_path and base_path != "/":
+            routes.append(Route("/.well-known/oauth-authorization-server" + base_path,
+                                metadata.endpoint, methods=["GET", "OPTIONS"]))
         return routes
 
 
 class ResourceTokenHandler(TokenHandler):
     async def handle(self, request):
         form = await request.form()
-        if form.get("resource") not in {None, PUBLIC_BASE + "/mcp"}:
+        if form.get("resource") not in {None, self.provider.colab_profile.base_url + "/mcp"}:
             return protected(JSONResponse({"error": "invalid_target"}, status_code=400))
         return await super().handle(request)
 
 
-def make_gateway_auth(base_url, state_dir, config_path=None):
-    if base_url != PUBLIC_BASE:
+def make_gateway_auth(base_url, state_dir, config_path=None, profile=PRODUCTION):
+    if base_url != profile.base_url:
         raise ValueError("Public Colab URL must match the registered Axxium callback")
     if config_path is None or not config_path.exists():
         return IdentityUnavailable(base_url)
-    config = AxxiumClient.read(config_path)
+    config = AxxiumClient.read(config_path, profile)
     with httpx.Client(timeout=10, follow_redirects=False) as http:
-        response = http.get(AXXIUM_ISSUER + "/.well-known/openid-configuration")
+        response = http.get(profile.issuer + "/.well-known/openid-configuration")
         response.raise_for_status()
-        discovery = validate_discovery(response.json())
+        discovery = validate_discovery(response.json(), profile)
+    if profile == STAGING:
+        state_dir = state_dir / "staging"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state_dir.is_symlink() or state_dir.stat().st_mode & 0o077:
         raise ValueError("OAuth state directory must be private (0700)")
@@ -287,14 +315,16 @@ def make_gateway_auth(base_url, state_dir, config_path=None):
         b"knoxx-colab-axxium-storage-v1\0" + config.client_secret.encode()).digest())
     storage = FernetEncryptionWrapper(key_value=DiskStore(directory=state_dir / "axxium-proxy"),
                                      fernet=Fernet(encryption_key))
-    return AxxiumOAuthProxy(
+    proxy = AxxiumOAuthProxy(
         upstream_authorization_endpoint=discovery["authorization_endpoint"],
         upstream_token_endpoint=discovery["token_endpoint"],
         upstream_revocation_endpoint=discovery["revocation_endpoint"],
         upstream_client_id=config.client_id, upstream_client_secret=config.client_secret,
-        token_verifier=AxxiumTokenVerifier(config, discovery["introspection_endpoint"]),
+        token_verifier=AxxiumTokenVerifier(config, discovery["introspection_endpoint"], profile=profile),
         base_url=base_url, redirect_path="/auth/callback", issuer_url=base_url,
         allowed_client_redirect_uris=list(config.allowed_client_redirect_uris), valid_scopes=SCOPES,
         forward_pkce=True, token_endpoint_auth_method="client_secret_post",
         client_storage=storage, require_authorization_consent=True,
         fallback_access_token_expiry_seconds=300)
+    proxy.colab_profile = profile
+    return proxy

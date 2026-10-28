@@ -250,3 +250,106 @@ async def test_proxy_http_mcp_identity_revocation_and_client_boundaries(tmp_path
         if file.is_file():
             assert b"fixture-axxium-access-7bdac9" not in file.read_bytes()
             assert b"fixture-axxium-refresh-083aa1" not in file.read_bytes()
+
+
+def test_closed_staging_profile_rejects_production_confusion(tmp_path):
+    from knoxx_colab_mcp.oauth import STAGING, PRODUCTION, auth_profile
+    from knoxx_colab_mcp.server import gateway_backend, validate_gateway_binding
+    path = tmp_path / "stage-client.json"
+    config = {"issuer": STAGING.issuer, "client_id": STAGING.client_id, "client_secret": SECRET,
+              "allowed_subjects": [ACTOR], "allowed_client_redirect_uris": ["http://127.0.0.1:18762/callback"]}
+    path.write_text(json.dumps(config))
+    path.chmod(0o600)
+    assert AxxiumClient.read(path, STAGING).client_id == STAGING.client_id
+    with pytest.raises(ValueError):
+        AxxiumClient.read(path, PRODUCTION)
+    for wrong in [{"issuer": PRODUCTION.issuer}, {"client_id": PRODUCTION.client_id},
+                  {"allowed_client_redirect_uris": []}]:
+        path.write_text(json.dumps({**config, **wrong}))
+        with pytest.raises(ValueError):
+            AxxiumClient.read(path, STAGING)
+    assert auth_profile("staging") == STAGING and auth_profile("production") == PRODUCTION
+    with pytest.raises(ValueError):
+        auth_profile("https://evil.invalid")
+    with pytest.raises(ValueError):
+        make_gateway_auth(PRODUCTION.base_url, tmp_path / "state", path, STAGING)
+    validate_gateway_binding("staging", "127.0.0.1", 18761)
+    for host, port in [("0.0.0.0", 18761), ("127.0.0.1", 18762), ("localhost", 18761)]:
+        with pytest.raises(ValueError):
+            validate_gateway_binding("staging", host, port)
+    class DenyEnv(dict):
+        def __getitem__(self, key):
+            raise AssertionError("Staging accessed a production bridge setting")
+        def get(self, key, default=None):
+            raise AssertionError("Staging accessed a production bridge setting")
+    backend = gateway_backend("staging", DenyEnv())
+    assert backend.status()["execution_verified"] is False
+
+
+async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatch):
+    from knoxx_colab_mcp.oauth import STAGING, PRODUCTION
+    from knoxx_colab_mcp.server import gateway_backend
+    path = tmp_path / "client.json"
+    callback = "http://127.0.0.1:18762/callback"
+    path.write_text(json.dumps({"issuer": STAGING.issuer, "client_id": STAGING.client_id,
+                               "client_secret": SECRET, "allowed_subjects": [ACTOR],
+                               "allowed_client_redirect_uris": [callback]}))
+    path.chmod(0o600)
+    discovery = {**DISCOVERY, "issuer": STAGING.issuer,
+                 **{key: value.replace(AXXIUM_ISSUER, STAGING.issuer)
+                    for key, value in DISCOVERY.items() if key.endswith("_endpoint") or key == "jwks_uri"}}
+    assert validate_discovery(discovery, STAGING) == discovery
+    with pytest.raises(ValueError):
+        validate_discovery(discovery, PRODUCTION)
+    with pytest.raises(ValueError):
+        validate_discovery({**discovery, "token_endpoint": DISCOVERY["token_endpoint"]}, STAGING)
+    class DiscoveryHTTP:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def get(self, url):
+            assert url == STAGING.issuer + "/.well-known/openid-configuration"
+            return httpx.Response(200, json=discovery, request=httpx.Request("GET", url))
+    with monkeypatch.context() as m:
+        m.setattr(oauth, "httpx", SimpleNamespace(Client=DiscoveryHTTP))
+        auth = make_gateway_auth(STAGING.base_url, tmp_path / "state", path, STAGING)
+    current_issuer = STAGING.issuer
+    async def introspect(request):
+        return httpx.Response(200, json={"active": True, "sub": ACTOR, "client_id": STAGING.client_id,
+            "exp": time.time() + 300, "scope": "openid profile", "iss": current_issuer})
+    auth._token_validator.transport = httpx.MockTransport(introspect)
+    assert await auth._token_validator.verify_token("stage-token")
+    current_issuer = PRODUCTION.issuer
+    assert await auth._token_validator.verify_token("stage-token") is None
+    current_issuer = STAGING.issuer
+    async with serve(make_server(gateway_backend("staging", {}), "", auth)) as base:
+        async with httpx.AsyncClient() as http:
+            metadata = (await http.get(base + "/.well-known/oauth-authorization-server")).json()
+            assert metadata["issuer"].rstrip("/") == STAGING.base_url
+            async def register(redirect):
+                return await http.post(base + "/register", json={"client_name": "staging fixture",
+                    "redirect_uris": [redirect], "token_endpoint_auth_method": "none",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"], "scope": "openid profile"})
+            assert (await register(CHATGPT_REDIRECT)).status_code == 400
+            registration = (await register(callback)).json()
+            verifier = "stage-fixture-verifier-" + "x" * 48
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            code = ClientCode(code="stage-fixture-code", client_id=registration["client_id"], redirect_uri=callback,
+                code_challenge=challenge, code_challenge_method="S256", scopes=SCOPES,
+                idp_tokens={"access_token": "stage-access", "refresh_token": "stage-refresh", "expires_in": 300,
+                            "refresh_expires_in": 600, "token_type": "Bearer"},
+                expires_at=time.time() + 60, created_at=time.time())
+            await auth._code_store.put(key=code.code, value=code, ttl=60)
+            fields = {"grant_type": "authorization_code", "client_id": registration["client_id"], "code": code.code,
+                      "redirect_uri": callback, "code_verifier": verifier, "resource": STAGING.base_url + "/mcp"}
+            assert (await http.post(base + "/token", data={**fields, "resource": PRODUCTION.base_url + "/mcp"})).status_code == 400
+            response = await http.post(base + "/token", data=fields)
+            assert response.status_code == 200, response.text
+            async with Client(StreamableHttpTransport(base + "/mcp", auth=response.json()["access_token"])) as mcp:
+                status = (await mcp.call_tool("colab_status", {})).data
+                assert status["mode"] == "staging-fixture" and status["execution_verified"] is False
+                connection = (await mcp.call_tool("colab_connect", {})).data
+                assert "cannot connect" in connection["instructions"] and "command" not in connection
+                assert (await mcp.call_tool("colab_call", {"name": "x", "arguments": {}}, raise_on_error=False)).is_error
+    assert (tmp_path / "state" / "staging" / "axxium-proxy").is_dir()
