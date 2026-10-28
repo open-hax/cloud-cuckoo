@@ -144,6 +144,35 @@ class Gateway:
         return ToolResult(content=result.content, structured_content=result.structured_content)
 
 
+class StagingBackend:
+    """A non-executing backend for validating staging identity only."""
+
+    def status(self):
+        return {"mode": "staging-fixture", "browser_connected": False,
+                "execution_verified": False,
+                "next_action": "This staging identity probe has no Colab connection."}
+
+    async def tools(self):
+        return []
+
+    async def call(self, name, arguments):
+        raise ValueError("Staging identity probe cannot execute Colab operations")
+
+
+def validate_gateway_binding(profile, host, port):
+    if profile == "staging" and (host != "127.0.0.1" or port != 18761):
+        raise ValueError("Staging gateway must bind 127.0.0.1:18761")
+
+
+def gateway_backend(profile, environ):
+    """Staging cannot read or forward to the production bridge or compute."""
+    if profile == "staging":
+        return StagingBackend()
+    if profile != "production":
+        raise ValueError("Unknown Colab authentication profile")
+    return Gateway(environ["COLAB_BRIDGE_URL"], read_secret(environ["COLAB_BRIDGE_TOKEN_FILE"]),
+                   environ.get("COLAB_COMPUTE_URL"))
+
 def make_server(backend, token: str, auth=None) -> FastMCP:
     server = FastMCP("Knoxx Colab", version="0.4.0", auth=auth or BearerVerifier(token),
                      lifespan=backend.lifespan if isinstance(backend, BrowserBridge) else None,
@@ -163,6 +192,8 @@ def make_server(backend, token: str, auth=None) -> FastMCP:
     @server.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False})
     async def colab_connect() -> dict:
         """Use this for safe connection instructions. The human opens the local browser; no Google credentials or connection tokens are returned."""
+        if isinstance(backend, StagingBackend):
+            return {"host": "local", "instructions": "This staging identity probe cannot connect to Colab."}
         return {"host": "Stealth", "command": "knoxx-colab-mcp open-browser",
                 "instructions": "Run from the installed Colab MCP environment on Stealth. Sign into Google in the opened Colab tab, accept its MCP connection, then call colab_status. The browser must remain open."}
 
@@ -199,16 +230,17 @@ def main():
             raise SystemExit("No browser opened. Run this command in the graphical Stealth session.")
         return
     token = read_secret(os.environ["COLAB_MCP_TOKEN_FILE"]) if args.mode == "bridge" else ""
-    backend = BrowserBridge(args.state_dir) if args.mode == "bridge" else Gateway(
-        os.environ["COLAB_BRIDGE_URL"], read_secret(os.environ["COLAB_BRIDGE_TOKEN_FILE"]),
-        os.environ.get("COLAB_COMPUTE_URL"))
+    profile_name = os.environ.get("COLAB_AUTH_PROFILE", "production")
+    if args.mode == "gateway":
+        validate_gateway_binding(profile_name, args.host, args.port)
+    backend = BrowserBridge(args.state_dir) if args.mode == "bridge" else gateway_backend(profile_name, os.environ)
     auth = None
     if args.mode == "gateway":
-        from knoxx_colab_mcp.oauth import make_gateway_auth
+        from knoxx_colab_mcp.oauth import auth_profile, make_gateway_auth
         config_path = os.environ.get("COLAB_AXXIUM_CLIENT_FILE")
         auth = make_gateway_auth(os.environ["COLAB_OAUTH_BASE_URL"],
                                  Path(os.environ["COLAB_OAUTH_STATE_DIR"]),
-                                 Path(config_path) if config_path else None)
+                                 Path(config_path) if config_path else None, auth_profile(profile_name))
     server = make_server(backend, token, auth=auth)
     server.run(transport="http", host=args.host, port=args.port,
                stateless_http=True, json_response=True, show_banner=False, log_level="warning")

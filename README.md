@@ -125,3 +125,22 @@ A separate typed capability and `colab-compute` skill are installed in local Kno
 Colab compute units are distinct from Google Cloud credits and Google AI product
 credits. Read the actual balance and current official subscription terms; never
 infer the account's grant from a plan name or from a browser connection.
+
+## Staging identity probe
+
+For an isolated Axxium staging authorization test, the `staging` profile pins
+`https://staging.axxium.promethean.rest/oidc` and a local-only gateway at
+`http://127.0.0.1:18761`. It requires its own `knoxx-colab-staging` client,
+secret, actor allowlist, and exact downstream client callbacks in a private
+0600 config. Its state is placed in the `staging` subdirectory of the supplied
+private OAuth state directory. Configure the staging Axxium client to accept
+exactly `http://127.0.0.1:18761/auth/callback` with loopback explicitly enabled.
+The localhost address must be reachable by the browser completing authorization.
+
+Set `COLAB_AUTH_PROFILE=staging`, `COLAB_OAUTH_BASE_URL=http://127.0.0.1:18761`,
+`COLAB_OAUTH_STATE_DIR` and `COLAB_AXXIUM_CLIENT_FILE`, then run
+`knoxx-colab-mcp gateway --host 127.0.0.1 --port 18761`. The profile refuses
+other bind addresses and ports, uses a non-executing fixture backend, and never
+reads bridge or compute credentials. It proves only the identity and MCP transport
+path; it cannot access an actual Colab notebook or allocate compute. Production
+remains the default and retains its existing pinned issuer and callback.
