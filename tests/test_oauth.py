@@ -73,7 +73,13 @@ def test_configuration_requires_private_file_and_explicit_actor_identity(tmp_pat
     assert AxxiumClient.read(path) == CONFIG
     path.write_text(json.dumps({**data, "allowed_client_redirect_uris": ["http://127.0.0.1:9876/callback"]}))
     assert AxxiumClient.read(path).allowed_client_redirect_uris == (CHATGPT_REDIRECT, "http://127.0.0.1:9876/callback")
-    for callback in ["http://evil.invalid/callback", "http://localhost:*/callback", "https://user@example.com/cb",
+    for callback in ["http://localhost:1/callback", "http://127.0.0.1:65535/callback"]:
+        path.write_text(json.dumps({**data, "allowed_client_redirect_uris": [callback]}))
+        assert AxxiumClient.read(path).allowed_client_redirect_uris == (CHATGPT_REDIRECT, callback)
+    for callback in ["http://evil.invalid/callback", "http://localhost:*/callback",
+                     "http://localhost/callback", "http://localhost:/callback", "http://127.0.0.1/callback",
+                     "http://localhost:0/callback", "http://127.0.0.1:65536/callback",
+                     "https://user@example.com/cb",
                      "https://example.com/cb?next=x", "https://example.com/cb#fragment", CHATGPT_REDIRECT]:
         path.write_text(json.dumps({**data, "allowed_client_redirect_uris": [callback]}))
         with pytest.raises(ValueError):

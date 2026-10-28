@@ -111,8 +111,10 @@ class AxxiumClient:
             try:
                 uri = AnyUrl(value)
                 parts = urlsplit(str(uri))
+                original = urlsplit(value)
                 valid = (parts.scheme == "https" or
-                         (parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1"}))
+                         (parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1"}
+                          and original.port is not None and 1 <= original.port <= 65535))
                 if not valid or not parts.hostname or parts.username or parts.password:
                     raise ValueError("Invalid client redirect URI")
             except (TypeError, ValueError) as exc:
