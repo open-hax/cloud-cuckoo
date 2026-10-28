@@ -24,6 +24,8 @@ from key_value.aio.stores.disk import DiskStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from mcp.server.auth.middleware.client_auth import AuthenticationError, ClientAuthenticator
 from mcp.server.auth.provider import RegistrationError
+from mcp.shared.auth import OAuthClientInformationFull
+from pydantic import AnyUrl
 from mcp.server.auth.routes import cors_middleware, create_protected_resource_routes
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
@@ -80,6 +82,7 @@ class AxxiumClient:
     client_id: str
     client_secret: str = field(repr=False)
     allowed_subjects: frozenset[str]
+    allowed_client_redirect_uris: tuple[str, ...] = (CHATGPT_REDIRECT,)
 
     @classmethod
     def read(cls, path: Path):
@@ -98,7 +101,26 @@ class AxxiumClient:
             for s in subjects
         ):
             raise ValueError("Explicit stable Axxium actor IDs are required; names, email and roles are not identities")
-        return cls(data["client_id"], secret, frozenset(subjects))
+        extra_redirects = data.get("allowed_client_redirect_uris", [])
+        if not isinstance(extra_redirects, list) or len(extra_redirects) > 16:
+            raise ValueError("Client redirect allowlist must contain at most 16 exact URIs")
+        redirects = [CHATGPT_REDIRECT]
+        for value in extra_redirects:
+            if not isinstance(value, str) or not value or len(value) > 2048 or any(c in value for c in "*?#[%\\"):
+                raise ValueError("Invalid client redirect URI")
+            try:
+                uri = AnyUrl(value)
+                parts = urlsplit(str(uri))
+                valid = (parts.scheme == "https" or
+                         (parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1"}))
+                if not valid or not parts.hostname or parts.username or parts.password:
+                    raise ValueError("Invalid client redirect URI")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Invalid client redirect URI") from exc
+            if str(uri) in redirects:
+                raise ValueError("Duplicate client redirect URI")
+            redirects.append(str(uri))
+        return cls(data["client_id"], secret, frozenset(subjects), tuple(redirects))
 
 
 def validate_discovery(data):
@@ -156,9 +178,19 @@ class AxxiumOAuthProxy(OAuthProxy):
     """Only protocol adaptations to the pinned proxy, never a human login form."""
 
     async def register_client(self, client_info):
-        if not client_info.redirect_uris or any(str(uri) != CHATGPT_REDIRECT for uri in client_info.redirect_uris):
-            raise RegistrationError("invalid_redirect_uri", "Use the exact registered ChatGPT callback")
+        if not client_info.redirect_uris or any(str(uri) not in self._allowed_client_redirect_uris for uri in client_info.redirect_uris):
+            raise RegistrationError("invalid_redirect_uri", "Use an operator-approved exact callback")
         return await super().register_client(client_info)
+
+    async def get_client(self, client_id):
+        client = await super().get_client(client_id)
+        if not client or not client.redirect_uris or any(
+            str(uri) not in self._allowed_client_redirect_uris for uri in client.redirect_uris
+        ):
+            return None
+        # ProxyDCRClient validates against global patterns, allowing another
+        # client's callback. The SDK model enforces this client's registered URIs.
+        return OAuthClientInformationFull.model_validate(client.model_dump())
 
     async def load_access_token(self, token):
         try:
@@ -260,7 +292,7 @@ def make_gateway_auth(base_url, state_dir, config_path=None):
         upstream_client_id=config.client_id, upstream_client_secret=config.client_secret,
         token_verifier=AxxiumTokenVerifier(config, discovery["introspection_endpoint"]),
         base_url=base_url, redirect_path="/auth/callback", issuer_url=base_url,
-        allowed_client_redirect_uris=[CHATGPT_REDIRECT], valid_scopes=SCOPES,
+        allowed_client_redirect_uris=list(config.allowed_client_redirect_uris), valid_scopes=SCOPES,
         forward_pkce=True, token_endpoint_auth_method="client_secret_post",
         client_storage=storage, require_authorization_consent=True,
         fallback_access_token_expiry_seconds=300)
