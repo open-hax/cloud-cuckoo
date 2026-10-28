@@ -1,0 +1,23 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "knoxx-colab",
+  "version": "0.4.0",
+  "description": "Work in browser Colab notebooks and run bounded remote compute jobs through the authenticated Knoxx gateway.",
+  "author": {
+    "name": "OpenHax"
+  },
+  "license": "GPL-3.0-or-later",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Knoxx Colab",
+        "shortDescription": "Work in Google Colab",
+        "longDescription": "Inspect, edit and execute your browser-connected Colab notebook, or run bounded CPU/GPU/TPU jobs with the official Colab CLI without keeping a tab open. Includes account compute-unit usage, job output and verified runtime cleanup. Google credentials stay in isolated services on Stealth.",
+        "developerName": "Aaron Beavers",
+        "category": "Developer Tools",
+        "capabilities": [],
+        "defaultPrompt": "Check my Colab connection and help me work in the connected notebook."
+      }
+    }
+  }
+}

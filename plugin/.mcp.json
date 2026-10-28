@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "colab": {
+      "type": "streamable-http",
+      "url": "https://knoxx.promethean.rest/colab/mcp",
+      "headers": {},
+      "extensions": {
+        "com.openai": {
+          "auth": {
+            "type": "oauth",
+            "client": {
+              "mode": "dcr"
+            },
+            "resource": "https://knoxx.promethean.rest/colab/mcp",
+            "baseScopes": [
+              "openid",
+              "profile"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

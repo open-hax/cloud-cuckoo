@@ -1,0 +1,27 @@
+[project]
+name = "knoxx-colab-mcp"
+version = "0.4.0"
+description = "Authenticated HTTP boundary around Google's official browser Colab MCP bridge"
+requires-python = ">=3.13"
+license = "GPL-3.0-or-later"
+dependencies = [
+  "colab-mcp @ git+https://github.com/googlecolab/colab-mcp@b9ab3899e0f1fa493390b1fd6d54aa2e464ecdf1",
+  "fastmcp==2.14.5",
+  "httpx>=0.28,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
+
+[project.scripts]
+knoxx-colab-mcp = "knoxx_colab_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.hatch.metadata]
+allow-direct-references = true

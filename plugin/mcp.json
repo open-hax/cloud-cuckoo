@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "colab": {
+      "type": "streamable-http",
+      "url": "https://knoxx.promethean.rest/colab/mcp",
+      "extensions": {
+        "com.openai": {
+          "auth": {
+            "type": "oauth",
+            "client": {
+              "mode": "dcr"
+            },
+            "resource": "https://knoxx.promethean.rest/colab/mcp",
+            "baseScopes": [
+              "openid",
+              "profile"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
