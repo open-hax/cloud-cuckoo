@@ -164,6 +164,10 @@ async def test_proxy_http_mcp_identity_revocation_and_client_boundaries(tmp_path
         m.setattr(oauth, "httpx", SimpleNamespace(Client=DiscoveryHTTP))
         auth = make_gateway_auth(PUBLIC_BASE, tmp_path / "state", path)
     assert isinstance(auth, AxxiumOAuthProxy)
+    upstream = auth._build_upstream_authorize_url("fixture-state", {
+        "resource": PUBLIC_BASE + "/mcp", "scopes": SCOPES, "proxy_code_verifier": "verifier"})
+    assert "resource" not in parse_qs(urlsplit(upstream).query)
+    assert parse_qs(urlsplit(upstream).query)["client_id"] == [CONFIG.client_id]
     active = True
     async def introspect(request):
         return httpx.Response(200, json={"active": active, "sub": ACTOR, "client_id": CONFIG.client_id,
@@ -313,6 +317,12 @@ async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatc
     with monkeypatch.context() as m:
         m.setattr(oauth, "httpx", SimpleNamespace(Client=DiscoveryHTTP))
         auth = make_gateway_auth(STAGING.base_url, tmp_path / "state", path, STAGING)
+    transaction = {"resource": STAGING.base_url + "/mcp", "scopes": SCOPES,
+                   "proxy_code_verifier": "verifier"}
+    upstream = auth._build_upstream_authorize_url("fixture-state", transaction)
+    assert "resource" not in parse_qs(urlsplit(upstream).query)
+    assert transaction["resource"] == STAGING.base_url + "/mcp"
+    assert parse_qs(urlsplit(upstream).query)["client_id"] == [STAGING.client_id]
     current_issuer = STAGING.issuer
     async def introspect(request):
         return httpx.Response(200, json={"active": True, "sub": ACTOR, "client_id": STAGING.client_id,
@@ -335,6 +345,16 @@ async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatc
             registration = (await register(callback)).json()
             verifier = "stage-fixture-verifier-" + "x" * 48
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            auth_params = {"client_id": registration["client_id"], "redirect_uri": callback,
+                           "response_type": "code", "scope": "openid profile", "state": "fixture",
+                           "code_challenge": challenge, "code_challenge_method": "S256"}
+            wrong = await http.get(base + "/authorize", params={**auth_params,
+                "resource": PRODUCTION.base_url + "/mcp"})
+            assert wrong.status_code == 302
+            wrong_query = parse_qs(urlsplit(wrong.headers["location"]).query)
+            assert wrong_query["error"] == ["invalid_request"] and "code" not in wrong_query
+            assert (await http.get(base + "/authorize", params={**auth_params,
+                "resource": STAGING.base_url + "/mcp"})).status_code in {302, 303}
             code = ClientCode(code="stage-fixture-code", client_id=registration["client_id"], redirect_uri=callback,
                 code_challenge=challenge, code_challenge_method="S256", scopes=SCOPES,
                 idp_tokens={"access_token": "stage-access", "refresh_token": "stage-refresh", "expires_in": 300,

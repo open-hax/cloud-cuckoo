@@ -23,7 +23,7 @@ import httpx
 from key_value.aio.stores.disk import DiskStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from mcp.server.auth.middleware.client_auth import AuthenticationError, ClientAuthenticator
-from mcp.server.auth.provider import RegistrationError
+from mcp.server.auth.provider import AuthorizeError, RegistrationError
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 from mcp.server.auth.routes import cors_middleware, create_protected_resource_routes
@@ -202,6 +202,22 @@ class AxxiumTokenVerifier(TokenVerifier):
 
 class AxxiumOAuthProxy(OAuthProxy):
     """Only protocol adaptations to the pinned proxy, never a human login form."""
+
+    async def authorize(self, client, params):
+        # MCP 1.30.0 cannot serialize FastMCP's invalid_target authorize error;
+        # refuse a cross-resource request with the supported invalid_request code.
+        resource = getattr(params, "resource", None)
+        if resource and self._resource_url and str(resource) != str(self._resource_url):
+            raise AuthorizeError(error="invalid_request", error_description="Resource does not match this server")
+        return await super().authorize(client, params)
+
+    def _build_upstream_authorize_url(self, txn_id, transaction):
+        # The downstream resource belongs to this gateway. FastMCP has already
+        # validated it against our MCP endpoint; Axxium issues client-scoped
+        # OIDC tokens and does not register the downstream URL as a resource.
+        # Retain the stored downstream resource as transaction evidence; the
+        # local JWT issuer and token guard enforce the gateway resource separately.
+        return super()._build_upstream_authorize_url(txn_id, {**transaction, "resource": None})
 
     async def register_client(self, client_info):
         if not client_info.redirect_uris or any(str(uri) not in self._allowed_client_redirect_uris for uri in client_info.redirect_uris):
