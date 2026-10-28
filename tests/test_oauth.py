@@ -71,6 +71,19 @@ def test_configuration_requires_private_file_and_explicit_actor_identity(tmp_pat
         AxxiumClient.read(path)
     path.chmod(0o600)
     assert AxxiumClient.read(path) == CONFIG
+    path.write_text(json.dumps({**data, "allowed_client_redirect_uris": ["http://127.0.0.1:9876/callback"]}))
+    assert AxxiumClient.read(path).allowed_client_redirect_uris == (CHATGPT_REDIRECT, "http://127.0.0.1:9876/callback")
+    for callback in ["http://localhost:1/callback", "http://127.0.0.1:65535/callback"]:
+        path.write_text(json.dumps({**data, "allowed_client_redirect_uris": [callback]}))
+        assert AxxiumClient.read(path).allowed_client_redirect_uris == (CHATGPT_REDIRECT, callback)
+    for callback in ["http://evil.invalid/callback", "http://localhost:*/callback",
+                     "http://localhost/callback", "http://localhost:/callback", "http://127.0.0.1/callback",
+                     "http://localhost:0/callback", "http://127.0.0.1:65536/callback",
+                     "https://user@example.com/cb",
+                     "https://example.com/cb?next=x", "https://example.com/cb#fragment", CHATGPT_REDIRECT]:
+        path.write_text(json.dumps({**data, "allowed_client_redirect_uris": [callback]}))
+        with pytest.raises(ValueError):
+            AxxiumClient.read(path)
     assert SECRET not in repr(CONFIG)
     for bad in [{"issuer": "https://other.invalid/oidc"}, {"client_id": "knoxx"},
                 {"client_secret": "short"}, {"allowed_subjects": []},
@@ -131,12 +144,15 @@ async def test_introspection_requires_current_grant_client_actor_scope_expiry():
     assert await verifier.verify_token("fixture-axxium-access-7bdac9") is None
 
 
-async def test_proxy_http_mcp_identity_revocation_and_client_boundaries(tmp_path, monkeypatch):
+@pytest.mark.parametrize("downstream", [CHATGPT_REDIRECT, "http://127.0.0.1:9876/callback"])
+async def test_proxy_http_mcp_identity_revocation_and_client_boundaries(tmp_path, monkeypatch, downstream):
     # Use the production factory, encrypted storage and HTTP surface. Only
     # discovery/introspection are fixture responses; no human login is implied.
     path = tmp_path / "client.json"
+    local_redirect = "http://127.0.0.1:9876/callback"
     path.write_text(json.dumps({"issuer": AXXIUM_ISSUER, "client_id": CONFIG.client_id,
-                               "client_secret": SECRET, "allowed_subjects": [ACTOR]}))
+                               "client_secret": SECRET, "allowed_subjects": [ACTOR],
+                               "allowed_client_redirect_uris": [local_redirect]}))
     path.chmod(0o600)
     class DiscoveryHTTP:
         def __init__(self, **kwargs): pass
@@ -163,13 +179,23 @@ async def test_proxy_http_mcp_identity_revocation_and_client_boundaries(tmp_path
                     "redirect_uris": [redirect], "token_endpoint_auth_method": "none",
                     "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"], "scope": "openid profile"})
             assert (await register("https://evil.invalid/callback")).status_code == 400
-            one = (await register()).json()
+            one = (await register(downstream)).json()
             two = (await register()).json()
+            local = (await register(local_redirect)).json()
+            assert "client_id" in local
             client = await auth.get_client(one["client_id"])
             verifier = "fixture-verifier-" + "x" * 48
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
-            start = await http.get(base + "/authorize", params={"client_id": one["client_id"],
+            crossed = await http.get(base + "/authorize", params={"client_id": local["client_id"],
                 "redirect_uri": CHATGPT_REDIRECT, "response_type": "code", "scope": "openid profile",
+                "code_challenge": challenge, "code_challenge_method": "S256", "state": "fixture"})
+            assert crossed.status_code == 400
+            removed = auth._allowed_client_redirect_uris
+            auth._allowed_client_redirect_uris = [CHATGPT_REDIRECT]
+            assert await auth.get_client(local["client_id"]) is None
+            auth._allowed_client_redirect_uris = removed
+            start = await http.get(base + "/authorize", params={"client_id": one["client_id"],
+                "redirect_uri": downstream, "response_type": "code", "scope": "openid profile",
                 "code_challenge": challenge, "code_challenge_method": "S256", "state": "fixture",
                 "resource": PUBLIC_BASE + "/mcp"})
             assert start.status_code in {302, 303}
@@ -178,14 +204,14 @@ async def test_proxy_http_mcp_identity_revocation_and_client_boundaries(tmp_path
             assert "operator_key" not in consent.text and SECRET not in consent.text
             # Seed the post-Axxium callback record, then exercise real SDK PKCE,
             # exchange, encrypted persistence, MCP auth and revocation over HTTP.
-            code = ClientCode(code="fixture-code", client_id=one["client_id"], redirect_uri=CHATGPT_REDIRECT,
+            code = ClientCode(code="fixture-code", client_id=one["client_id"], redirect_uri=downstream,
                 code_challenge=challenge, code_challenge_method="S256", scopes=SCOPES,
                 idp_tokens={"access_token": "fixture-axxium-access-7bdac9", "refresh_token": "fixture-axxium-refresh-083aa1",
                             "expires_in": 300, "refresh_expires_in": 600, "token_type": "Bearer"},
                 expires_at=time.time() + 60, created_at=time.time())
             await auth._code_store.put(key=code.code, value=code, ttl=60)
             fields = {"grant_type": "authorization_code", "client_id": one["client_id"], "code": code.code,
-                      "redirect_uri": CHATGPT_REDIRECT, "code_verifier": verifier, "resource": PUBLIC_BASE + "/mcp"}
+                      "redirect_uri": downstream, "code_verifier": verifier, "resource": PUBLIC_BASE + "/mcp"}
             assert (await http.post(base + "/token", data={**fields, "resource": "https://other.invalid/mcp"})).status_code == 400
             assert (await http.post(base + "/token", data={**fields, "code_verifier": "wrong"})).status_code == 400
             result = await http.post(base + "/token", data=fields)

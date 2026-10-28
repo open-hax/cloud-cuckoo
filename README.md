@@ -75,6 +75,17 @@ The registered callback is `https://knoxx.promethean.rest/colab/auth/callback`.
 The client secret is a service credential, never a human login credential.
 No credential file is provisioned until the central identity release is qualified.
 Wrong configuration stops startup; absence denies access without a substitute.
+The ChatGPT redirect remains enabled by default. To admit another harness,
+optionally add `allowed_client_redirect_uris` to the private client JSON as a
+list of exact callback URLs, for example `["http://127.0.0.1:9876/callback"]`.
+Each extra URL must use HTTPS or an explicitly configured HTTP `localhost` or
+`127.0.0.1` address and port. Wildcards, queries, fragments, percent escapes,
+credentials and more than 16 extra callbacks are rejected. A client may authorize
+only with a callback it registered and which remains on the operator's current
+allowlist. Removing a callback disables its registered clients after the gateway
+restarts, but does not itself revoke previously issued tokens; revoke the grant
+through Axxium when needed. Harnesses choosing ephemeral loopback ports need a
+fixed callback configuration compatible with this exact policy.
 Run `.venv/bin/python verify_oauth.py` for read-only identity preflight; exit 2
 means the shared issuer is pending. It never submits credentials or approves
 human consent. Do not publicly share this single-operator package.
