@@ -215,7 +215,8 @@ class AxxiumOAuthProxy(OAuthProxy):
         # The downstream resource belongs to this gateway. FastMCP has already
         # validated it against our MCP endpoint; Axxium issues client-scoped
         # OIDC tokens and does not register the downstream URL as a resource.
-        # Keep the stored transaction intact for local token audience binding.
+        # Retain the stored downstream resource as transaction evidence; the
+        # local JWT issuer and token guard enforce the gateway resource separately.
         return super()._build_upstream_authorize_url(txn_id, {**transaction, "resource": None})
 
     async def register_client(self, client_info):
