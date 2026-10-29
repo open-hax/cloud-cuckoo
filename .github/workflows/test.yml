@@ -16,6 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -24,8 +25,13 @@ jobs:
         with:
           version: '0.9.5'
       - name: Install locked application and test dependencies without credentials
+        env:
+          TESTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mkdir -m 700 "$RUNNER_TEMP/test-home" "$RUNNER_TEMP/test-evidence"
+          test "$(git rev-parse HEAD)" = "$TESTED_SOURCE_SHA"
+          printf '%s\n' "$TESTED_SOURCE_SHA" > "$RUNNER_TEMP/test-evidence/source-sha.txt"
+          git ls-files -z | xargs -0 sha256sum > "$RUNNER_TEMP/test-evidence/tracked-source.sha256"
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
             UV_CACHE_DIR="$RUNNER_TEMP/uv-cache" TMPDIR="$RUNNER_TEMP" \
             uv sync --frozen --extra test --python 3.13
@@ -52,6 +58,7 @@ jobs:
               }
             cat "$evidence/stdout.txt" "$evidence/stderr.txt"
           done
+          sha256sum --check "$RUNNER_TEMP/test-evidence/tracked-source.sha256"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
