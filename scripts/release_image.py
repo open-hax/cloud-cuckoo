@@ -134,16 +134,19 @@ def admit(source_sha, checkout, archive, test_directory, receipt, *, api=github,
     if not HEX40.fullmatch(source_sha):
         raise Refusal('An explicit full lowercase merged source SHA is required')
     private_repository(api)
+    print('Private source repository metadata verified', flush=True)
     head = command(['git', '-C', str(checkout), 'rev-parse', 'HEAD']).decode().strip()
     if head != native['workflow_sha']:
         raise Refusal('The builder checkout differs from the native workflow revision')
     command(['git', '-C', str(checkout), 'cat-file', '-e', source_sha + '^{commit}'])
     command(['git', '-C', str(checkout), 'merge-base', '--is-ancestor', source_sha, head])
+    print('Tracked source ancestry verified', flush=True)
     pulls = api(f'repos/{REPOSITORY}/commits/{source_sha}/pulls?per_page=100')
     matching = [p for p in pulls if p.get('merged_at') and p.get('merge_commit_sha') == source_sha and
                 p.get('base', {}).get('ref') == 'main' and p.get('base', {}).get('repo', {}).get('full_name') == REPOSITORY]
     if len(matching) != 1 or type(matching[0].get('number')) is not int:
         raise Refusal('Source must be the actual merge commit of one accepted main PR')
+    print('Native merged PR evidence verified', flush=True)
     with Path(archive).open('xb') as stream:
         command(['git', '-C', str(checkout), 'archive', '--format=tar', source_sha], stdout=stream)
     Path(archive).chmod(0o600)
