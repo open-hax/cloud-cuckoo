@@ -50,11 +50,13 @@ class AuthProfile:
 PRODUCTION = AuthProfile(AXXIUM_ISSUER, PUBLIC_BASE, "knoxx-colab", (CHATGPT_REDIRECT,))
 STAGING = AuthProfile("https://staging.axxium.promethean.rest/oidc",
                       "http://127.0.0.1:18761", "knoxx-colab-staging", ())
+TRANSPORT_STAGING = AuthProfile("https://staging.axxium.promethean.rest/oidc",
+                                "http://127.0.0.1:18771", "knoxx-colab-transport-staging", ())
 
 
 def auth_profile(name):
     """Select only a compiled-in environment, never an operator supplied issuer."""
-    profiles = {"production": PRODUCTION, "staging": STAGING}
+    profiles = {"production": PRODUCTION, "staging": STAGING, "transport-staging": TRANSPORT_STAGING}
     if name not in profiles:
         raise ValueError("Unknown Colab authentication profile")
     return profiles[name]
@@ -424,6 +426,8 @@ def make_gateway_auth(base_url, state_dir, config_path=None, profile=PRODUCTION)
         discovery = validate_discovery(response.json(), profile)
     if profile == STAGING:
         state_dir = state_dir / "staging"
+    elif profile == TRANSPORT_STAGING:
+        state_dir = state_dir / "transport-staging"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state_dir.is_symlink() or state_dir.stat().st_mode & 0o077:
         raise ValueError("OAuth state directory must be private (0700)")

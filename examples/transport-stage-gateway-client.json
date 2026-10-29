@@ -1,0 +1,7 @@
+{
+  "issuer": "https://staging.axxium.promethean.rest/oidc",
+  "client_id": "knoxx-colab-transport-staging",
+  "client_secret": "UNSET",
+  "allowed_subjects": ["actor_00000000-0000-4000-8000-000000000001"],
+  "allowed_client_redirect_uris": ["http://127.0.0.1:18776/callback"]
+}
