@@ -65,6 +65,14 @@ qualified and a confidential Colab client is registered, public authorization
 returns HTTP 503 with an Axxium pending page and all public tokens are rejected.
 Private local Knoxx bridge connections continue independently.
 
+Pending identity still publishes the gateway's OAuth discovery document, using
+the same MCP SDK metadata builder as the configured proxy. Clients can refresh
+the pinned issuer, endpoints, `openid profile` scopes and S256 contract before
+activation. Discovery is not a readiness signal: registration, authorization,
+token exchange, revocation and callbacks continue to return 503, the health
+response reports `identity_available: false`, and no token is accepted. Pending
+discovery responses are not cached.
+
 The prepared relying-party adapter uses FastMCP's OAuth proxy with S256 PKCE,
 encrypted persistent token storage and live Axxium grant introspection on every
 request. `COLAB_AXXIUM_CLIENT_FILE` names a private regular 0600 JSON file with

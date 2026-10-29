@@ -28,7 +28,8 @@ from mcp.server.auth.middleware.client_auth import AuthenticationError, ClientAu
 from mcp.server.auth.provider import AuthorizeError, RegistrationError, TokenError
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
-from mcp.server.auth.routes import cors_middleware, create_protected_resource_routes
+from mcp.server.auth.routes import MetadataHandler, build_metadata, cors_middleware, create_protected_resource_routes
+from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
@@ -68,7 +69,7 @@ def protected(response):
 
 
 class IdentityUnavailable(AuthProvider):
-    """Keep public transport running without substituting another login method."""
+    """Publish the gateway contract while every grant and token remains denied."""
 
     def __init__(self, base_url=PUBLIC_BASE):
         super().__init__(base_url=base_url, required_scopes=SCOPES)
@@ -94,9 +95,23 @@ class IdentityUnavailable(AuthProvider):
         routes = create_protected_resource_routes(
             resource_url=self._resource_url, authorization_servers=[self.base_url],
             scopes_supported=SCOPES, resource_name="Knoxx Colab (Axxium pending)")
-        paths = ["/authorize", "/consent", "/register", "/token", "/revoke", "/auth/callback",
-                 "/.well-known/oauth-authorization-server",
-                 "/.well-known/oauth-authorization-server" + urlsplit(str(self.base_url)).path]
+        # Use the same SDK metadata builder as the active FastMCP OAuth proxy.
+        # Discovery describes the fixed protocol contract, not issuer readiness;
+        # it must not install grant handlers or create client/token storage.
+        assert self.base_url is not None
+        handler = MetadataHandler(build_metadata(
+            self.base_url, None,
+            ClientRegistrationOptions(enabled=True, valid_scopes=SCOPES),
+            RevocationOptions(enabled=True)))
+
+        async def metadata(request):
+            return protected(await handler.handle(request))
+
+        discovery_paths = ["/.well-known/oauth-authorization-server",
+                           "/.well-known/oauth-authorization-server" + urlsplit(str(self.base_url)).path]
+        routes.extend(Route(path, cors_middleware(metadata, ["GET", "OPTIONS"]), methods=["GET", "OPTIONS"])
+                      for path in dict.fromkeys(discovery_paths))
+        paths = ["/authorize", "/consent", "/register", "/token", "/revoke", "/auth/callback"]
         return routes + [Route(path, self.unavailable, methods=["GET", "POST", "OPTIONS"])
                          for path in dict.fromkeys(paths)]
 
