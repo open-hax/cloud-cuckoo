@@ -38,6 +38,14 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.9.5'
+      - name: Test the current controller publication boundaries without credentials
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/controller-test-home"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/controller-test-home" LANG=C.UTF-8 \
+            UV_CACHE_DIR="$RUNNER_TEMP/uv-cache" TMPDIR="$RUNNER_TEMP" \
+            uv run --project "$GITHUB_WORKSPACE/controller" --python 3.13 --frozen --extra test \
+            python -m pytest -q "$GITHUB_WORKSPACE/controller/tests/test_release_image.py" \
+            --junitxml "$RUNNER_TEMP/controller-tests.xml"
       - name: Admit merged source and archive its tracked bytes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,6 +69,8 @@ jobs:
             --archive "$RUNNER_TEMP/source.tar" --receipt "$RUNNER_TEMP/admission.json" \
             --report "$RUNNER_TEMP/tests.xml" --build-directory "$RUNNER_TEMP/source-build" \
             --output "$RUNNER_TEMP/build-artifact"
+          cp "$RUNNER_TEMP/controller-tests.xml" "$RUNNER_TEMP/build-artifact/controller-tests.xml"
+          cp "$RUNNER_TEMP/tests.xml" "$RUNNER_TEMP/build-artifact/source-tests.xml"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload
         with:

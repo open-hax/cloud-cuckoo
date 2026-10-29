@@ -128,8 +128,11 @@ Deployment definitions and rollback instructions belong to the Services repo:
 
 The source repository owns the manual **Publish private Cloud Cuckoo image**
 workflow. Run it on `main` with `source_sha` set to a full commit SHA that GitHub
-identifies as the merge commit of an accepted PR into `main`. The workflow tests
-only archived tracked source, builds a fresh archive context with that SHA in
+identifies as the merge commit of an accepted PR into `main`. The contents-read
+build job first tests the current controller's publication boundaries in a clean
+environment, including when the selected application source predates that
+controller. It then tests archived tracked source separately, retains both test
+reports, and builds a fresh archive context with that SHA in
 `SOURCE_REVISION`, and checks the actual image as user `1000:1000` with a read-only
 filesystem and no network. The pending identity smoke must preserve discovery,
 HTTP 503 for grant routes, HTTP 401 for MCP calls, and `identity_available: false`.
