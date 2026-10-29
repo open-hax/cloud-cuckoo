@@ -52,13 +52,51 @@ async def test_pending_identity_never_accepts_operator_key(tmp_path):
                 assert "<input" not in page.text and "<form" not in page.text
                 assert "operator_key" not in page.text and GATEWAY_TOKEN not in page.text
                 assert page.headers["cache-control"] == "no-store"
-            for path in ["/consent", "/register", "/token", "/auth/callback"]:
+            for path in ["/authorize", "/consent", "/register", "/token", "/revoke", "/auth/callback"]:
                 assert (await http.post(base + path, data={"operator_key": GATEWAY_TOKEN})).status_code == 503
-            assert (await http.get(base + "/.well-known/oauth-authorization-server/colab")).status_code == 503
+            discovered = []
+            for path in ["/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/colab"]:
+                response = await http.get(base + path, headers={"Origin": "https://chatgpt.com"})
+                assert response.status_code == 200
+                assert response.headers["cache-control"] == "no-store"
+                assert response.headers["access-control-allow-origin"] == "*"
+                discovered.append(response.json())
+                preflight = await http.options(base + path, headers={
+                    "Origin": "https://chatgpt.com", "Access-Control-Request-Method": "GET"})
+                assert preflight.status_code == 200
+                assert (await http.post(base + path)).status_code == 405
+            assert discovered[0] == discovered[1]
+            metadata = discovered[0]
+            assert metadata["issuer"] == PUBLIC_BASE
+            assert metadata["scopes_supported"] == SCOPES
+            assert metadata["code_challenge_methods_supported"] == ["S256"]
+            for key, path in {"authorization_endpoint": "/authorize", "token_endpoint": "/token",
+                              "registration_endpoint": "/register", "revocation_endpoint": "/revoke"}.items():
+                assert metadata[key] == PUBLIC_BASE + path
             resource = (await http.get(base + "/.well-known/oauth-protected-resource/colab/mcp")).json()
             assert resource["resource"] == PUBLIC_BASE + "/mcp"
             assert resource["authorization_servers"] == [PUBLIC_BASE]
+            assert resource["scopes_supported"] == metadata["scopes_supported"]
             assert (await http.get(base + "/health")).json()["identity_available"] is False
+    assert not (tmp_path / "state").exists()
+
+
+async def test_pending_discovery_matches_the_active_proxy_contract():
+    active = AxxiumOAuthProxy(
+        upstream_authorization_endpoint=DISCOVERY["authorization_endpoint"],
+        upstream_token_endpoint=DISCOVERY["token_endpoint"],
+        upstream_revocation_endpoint=DISCOVERY["revocation_endpoint"],
+        upstream_client_id=CONFIG.client_id, upstream_client_secret=SECRET,
+        token_verifier=AxxiumTokenVerifier(CONFIG, DISCOVERY["introspection_endpoint"]),
+        base_url=PUBLIC_BASE, issuer_url=PUBLIC_BASE, valid_scopes=SCOPES,
+        allowed_client_redirect_uris=[CHATGPT_REDIRECT])
+    active.colab_profile = oauth.PRODUCTION
+    pending = IdentityUnavailable()
+    async with serve(make_server(StatusBackend(), GATEWAY_TOKEN, pending)) as pending_base:
+        async with serve(make_server(StatusBackend(), GATEWAY_TOKEN, active)) as active_base:
+            async with httpx.AsyncClient() as http:
+                path = "/.well-known/oauth-authorization-server/colab"
+                assert (await http.get(pending_base + path)).json() == (await http.get(active_base + path)).json()
 
 
 def test_configuration_requires_private_file_and_explicit_actor_identity(tmp_path):
