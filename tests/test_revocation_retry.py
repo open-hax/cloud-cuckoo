@@ -19,7 +19,7 @@ from test_oauth import ACTOR, SECRET, DISCOVERY, CONFIG, StatusBackend
 from test_transport import serve, GATEWAY_TOKEN
 
 
-@pytest.mark.parametrize("failure_index", [0, 1])
+@pytest.mark.parametrize("failure_index", [0, 1, "crash", "before-marker"])
 async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatch, failure_index):
     path = tmp_path / "client.json"
     path.write_text(json.dumps({"issuer": oauth.AXXIUM_ISSUER, "client_id": CONFIG.client_id,
@@ -54,7 +54,8 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
         code = ClientCode(code="code-" + suffix, client_id=client_id, redirect_uri=CHATGPT_REDIRECT,
             code_challenge=challenge, code_challenge_method="S256", scopes=SCOPES,
             idp_tokens={"access_token": "upstream-access-" + suffix, "refresh_token": "upstream-refresh-" + suffix,
-                        "expires_in": 300, "refresh_expires_in": 600, "token_type": "Bearer"},
+                        "expires_in": 3 if suffix == "a" and isinstance(failure_index, str) else 300,
+                        "refresh_expires_in": 600, "token_type": "Bearer"},
             expires_at=time.time() + 60, created_at=time.time())
         await auth._code_store.put(key=code.code, value=code, ttl=60)
         response = await http.post(base + "/token", data={"grant_type": "authorization_code", "client_id": client_id,
@@ -79,17 +80,34 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
             assert await auth.load_access_token(other["access_token"])
             client_info = await auth.get_client(client)
             prevalidated_refresh = await auth.load_refresh_token(client_info, tokens["refresh_token"])
+            original_put = auth._client_storage.put
+            async def crash_after_family(*args, **kwargs):
+                family_write = kwargs.get("collection") == auth._pending_collection and kwargs.get("key", "").startswith("family-")
+                if family_write and failure_index == "before-marker":
+                    raise RuntimeError("fixture crash before family marker")
+                await original_put(*args, **kwargs)
+                if family_write and failure_index == "crash":
+                    raise RuntimeError("fixture crash after durable family marker")
             with monkeypatch.context() as m:
                 m.setattr(oauth, "httpx", SimpleNamespace(
                     AsyncClient=lambda **kw: factory(**kw, transport=httpx.MockTransport(unavailable)), HTTPError=httpx.HTTPError))
+                if isinstance(failure_index, str):
+                    m.setattr(auth._client_storage, "put", crash_after_family)
                 response = await http.post(base + "/revoke", data={"client_id": client, "token": tokens["access_token"]})
-            assert response.status_code == 503
-            assert upstream_requests == ["upstream-refresh-a", "upstream-access-a"][:failure_index + 1]
+            assert response.status_code == (500 if isinstance(failure_index, str) else 503)
+            expected_calls = 0 if isinstance(failure_index, str) else failure_index + 1
+            assert upstream_requests == ["upstream-refresh-a", "upstream-access-a"][:expected_calls]
+            if isinstance(failure_index, str):
+                await asyncio.sleep(3.2)  # The original access token and its original JTI TTL expire.
             assert await auth.load_access_token(tokens["access_token"]) is None
-            assert await auth.load_refresh_token(client_info, tokens["refresh_token"]) is None
-            # A refresh prevalidated before revocation cannot resurrect the family.
-            with pytest.raises(TokenError, match="Refresh token unavailable"):
-                await auth.exchange_refresh_token(client_info, prevalidated_refresh, SCOPES)
+            if failure_index == "before-marker":
+                # No revocation decision was durably recorded before the crash.
+                assert await auth.load_refresh_token(client_info, tokens["refresh_token"])
+            else:
+                assert await auth.load_refresh_token(client_info, tokens["refresh_token"]) is None
+                # A refresh prevalidated before revocation cannot resurrect the family.
+                with pytest.raises(TokenError, match="Refresh token unavailable"):
+                    await auth.exchange_refresh_token(client_info, prevalidated_refresh, SCOPES)
             assert await auth.load_access_token(other["access_token"])
             assert await auth.load_refresh_token(await auth.get_client(other_client), other["refresh_token"])
             # Another DCR client cannot finish this family's pending revocation.
@@ -98,7 +116,20 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
                     AsyncClient=lambda **kw: factory(**kw, transport=httpx.MockTransport(unavailable)), HTTPError=httpx.HTTPError))
                 wrong = await http.post(base + "/revoke", data={"client_id": other_client, "token": tokens["access_token"]})
             assert wrong.status_code == 200
-            assert len(upstream_requests) == failure_index + 1
+            assert len(upstream_requests) == expected_calls
+            # Validly signed tokens with the wrong issuer, audience or client,
+            # and an invalid signature, cannot target this pending family.
+            original_claims = dict(auth.jwt_issuer._jwt.decode(tokens["access_token"], auth._jwt_signing_key))
+            headers = {"alg": "HS256", "typ": "JWT"}
+            invalid_tokens = [auth.jwt_issuer._jwt.encode(headers, {**original_claims, field: "wrong"}, auth._jwt_signing_key).decode()
+                              for field in ("iss", "aud", "client_id")]
+            invalid_tokens.append(auth.jwt_issuer._jwt.encode(headers, original_claims, b"x" * 32).decode())
+            with monkeypatch.context() as m:
+                m.setattr(oauth, "httpx", SimpleNamespace(
+                    AsyncClient=lambda **kw: factory(**kw, transport=httpx.MockTransport(unavailable)), HTTPError=httpx.HTTPError))
+                for invalid in invalid_tokens:
+                    assert (await http.post(base + "/revoke", data={"client_id": client, "token": invalid})).status_code == 200
+            assert len(upstream_requests) == expected_calls
             for file in (tmp_path / "state").rglob("*"):
                 if file.is_file():
                     assert b"upstream-access-a" not in file.read_bytes()

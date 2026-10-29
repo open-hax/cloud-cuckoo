@@ -17,6 +17,7 @@ import time
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
+from authlib.jose import JsonWebToken
 from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
 from fastmcp.server.auth.auth import TokenHandler
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
@@ -221,6 +222,20 @@ class AxxiumOAuthProxy(OAuthProxy):
         return await self._client_storage.get(key="family-" + family_id,
                                               collection=self._pending_collection)
 
+    async def _revocation_family_for_token(self, token, client_id):
+        # Revocation may be retried after a short-lived access token expires.
+        # Verify the signature and fixed identities, but never use this path
+        # for access or refresh. The mapping is prolonged before marking a
+        # family pending, so it survives a crash without a separate index.
+        payload = JsonWebToken(["HS256"]).decode(token, self._jwt_signing_key)
+        if (payload.get("iss") != self.jwt_issuer.issuer or
+                payload.get("aud") != self.jwt_issuer.audience or
+                payload.get("client_id") != client_id or
+                not isinstance(payload.get("jti"), str) or not payload["jti"] or
+                payload.get("token_use") not in {None, "refresh"}):
+            raise ValueError("Invalid revocation credential")
+        return payload, await self._jti_mapping_store.get(key=payload["jti"])
+
     async def authorize(self, client, params):
         # MCP 1.30.0 cannot serialize FastMCP's invalid_target authorize error;
         # refuse a cross-resource request with the supported invalid_request code.
@@ -310,29 +325,26 @@ class AxxiumOAuthProxy(OAuthProxy):
             return protected(JSONResponse({"error": "invalid_request"}, status_code=400))
         async with self._family_lock:
             token_hash = hashlib.sha256(raw.encode()).hexdigest()
-            alias_key = "token-" + token_hash
-            alias = await self._client_storage.get(key=alias_key, collection=self._pending_collection)
-            pending = await self._pending_family(alias["family_id"]) if alias else None
-            payload = None
+            try:
+                payload, mapping = await self._revocation_family_for_token(raw, client.client_id)
+                pending = await self._pending_family(mapping.upstream_token_id) if mapping else None
+                upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id) if mapping else None
+            except Exception:
+                return protected(Response(status_code=200))
             if pending is None:
-                try:
-                    payload, mapping = await self._family_for_token(raw)
-                    upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id) if mapping else None
-                except Exception:
-                    upstream = None
                 if not upstream or upstream.client_id != client.client_id:
                     return protected(Response(status_code=200))
-                pending = await self._pending_family(upstream.upstream_token_id)
-                if pending is None:
-                    pending = {"family_id": upstream.upstream_token_id, "client_id": upstream.client_id,
-                               "access_token": upstream.access_token, "refresh_token": upstream.refresh_token}
-                    # This store is the same encrypted, persistent store used for
-                    # upstream tokens. Mark before any outbound revocation.
-                    ttl = max(30 * 86400, int((upstream.refresh_token_expires_at or upstream.expires_at) - time.time()), 1)
-                    await self._client_storage.put(key="family-" + upstream.upstream_token_id, value=pending,
-                                                   collection=self._pending_collection, ttl=ttl)
-                await self._client_storage.put(key=alias_key, value={"family_id": upstream.upstream_token_id},
-                                               collection=self._pending_collection, ttl=30 * 86400)
+                pending = {"family_id": upstream.upstream_token_id, "client_id": upstream.client_id,
+                           "access_token": upstream.access_token, "refresh_token": upstream.refresh_token}
+                ttl = max(30 * 86400, int((upstream.refresh_token_expires_at or upstream.expires_at) - time.time()), 1)
+                # Extend only the lookup, never the credential's lifetime. If
+                # the process crashes before the marker is written, no state
+                # has been revoked and a retry can still find the same family.
+                await self._jti_mapping_store.put(key=payload["jti"], value=mapping, ttl=ttl)
+                # One encrypted record both denies the family and retains what
+                # is needed for central retry. There is no second alias write.
+                await self._client_storage.put(key="family-" + upstream.upstream_token_id, value=pending,
+                                               collection=self._pending_collection, ttl=ttl)
             if not pending or pending["client_id"] != client.client_id:
                 return protected(Response(status_code=200))
             try:
@@ -350,7 +362,6 @@ class AxxiumOAuthProxy(OAuthProxy):
                 await self._jti_mapping_store.delete(key=payload["jti"])
             await self._refresh_token_store.delete(key=token_hash)
             await self._client_storage.delete(key="family-" + pending["family_id"], collection=self._pending_collection)
-            await self._client_storage.delete(key=alias_key, collection=self._pending_collection)
         return protected(Response(status_code=200))
 
     def get_routes(self, mcp_path=None):
