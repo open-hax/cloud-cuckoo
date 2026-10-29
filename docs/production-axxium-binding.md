@@ -59,7 +59,9 @@ issuer or human login.
 ## Gateway deployment and verification
 
 Deploy the merged Cloud Cuckoo source containing PR #3's resource-forwarding
-fix, at or descended from `000064ebf337e86292aa95bf200e4e0ca27c30a9`. The
+fix and PR #4's revocation-retry and authorization-code serialization fixes,
+at or descended from `6925402ebe8dbf8c22f9287fa2be1acbb86e7a24`. PR #4 must
+be merged and the resulting release qualified before production activation. The
 previous 0.4.0 image forwards the downstream MCP `resource` to Axxium and failed
 the staging authorization flow. Record the built image digest and prove the
 running image's source revision; a reused `candidate` tag is not provenance.
