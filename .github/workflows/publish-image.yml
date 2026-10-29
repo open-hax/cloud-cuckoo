@@ -1,0 +1,111 @@
+name: Publish private Cloud Cuckoo image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full SHA of an actual merged main PR commit
+        required: true
+        type: string
+
+permissions: {}
+concurrency:
+  group: cloud-cuckoo-private-image-publication
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'open-hax/cloud-cuckoo' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      image_id: ${{ steps.build.outputs.image_id }}
+      docker_archive_sha256: ${{ steps.build.outputs.docker_archive_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: controller
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.9.5'
+      - name: Admit merged source and archive its tracked bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          python3 controller/scripts/release_image.py admit \
+            --source-sha "$SOURCE_SHA" --checkout "$GITHUB_WORKSPACE/controller" \
+            --archive "$RUNNER_TEMP/source.tar" --test-directory "$RUNNER_TEMP/source-tests" \
+            --receipt "$RUNNER_TEMP/admission.json"
+      - name: Test archived source without publishing or host credentials
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/test-home"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
+            UV_CACHE_DIR="$RUNNER_TEMP/uv-cache" TMPDIR="$RUNNER_TEMP" \
+            uv run --project "$RUNNER_TEMP/source-tests" --python 3.13 --frozen --extra test \
+            python -m pytest -q "$RUNNER_TEMP/source-tests/tests" --junitxml "$RUNNER_TEMP/tests.xml"
+      - name: Build a fresh archive context and verify the actual image
+        id: build
+        run: |
+          python3 controller/scripts/release_image.py build \
+            --archive "$RUNNER_TEMP/source.tar" --receipt "$RUNNER_TEMP/admission.json" \
+            --report "$RUNNER_TEMP/tests.xml" --build-directory "$RUNNER_TEMP/source-build" \
+            --output "$RUNNER_TEMP/build-artifact"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: cloud-cuckoo-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: controller
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/build-artifact
+      - name: Publish using only this repository's ephemeral token
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+          BUILD_ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+          BUILD_IMAGE_ID: ${{ needs.build.outputs.image_id }}
+          BUILD_ARCHIVE_SHA: ${{ needs.build.outputs.docker_archive_sha256 }}
+        run: |
+          python3 controller/scripts/release_image.py publish \
+            --directory "$RUNNER_TEMP/build-artifact" --artifact-id "$BUILD_ARTIFACT_ID" \
+            --artifact-digest "$BUILD_ARTIFACT_DIGEST" --expected-image-id "$BUILD_IMAGE_ID" \
+            --expected-archive-sha "$BUILD_ARCHIVE_SHA" --output "$RUNNER_TEMP/release-receipt.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cloud-cuckoo-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-receipt.json
+          if-no-files-found: warn
+          retention-days: 30
