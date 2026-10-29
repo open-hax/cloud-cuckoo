@@ -222,7 +222,7 @@ class AxxiumOAuthProxy(OAuthProxy):
         return await self._client_storage.get(key="family-" + family_id,
                                               collection=self._pending_collection)
 
-    async def _revocation_family_for_token(self, token, client_id):
+    def _revocation_payload(self, token, client_id):
         # Revocation may be retried after a short-lived access token expires.
         # Verify the signature and fixed identities, but never use this path
         # for access or refresh. The mapping is prolonged before marking a
@@ -234,7 +234,7 @@ class AxxiumOAuthProxy(OAuthProxy):
                 not isinstance(payload.get("jti"), str) or not payload["jti"] or
                 payload.get("token_use") not in {None, "refresh"}):
             raise ValueError("Invalid revocation credential")
-        return payload, await self._jti_mapping_store.get(key=payload["jti"])
+        return payload
 
     async def authorize(self, client, params):
         # MCP 1.30.0 cannot serialize FastMCP's invalid_target authorize error;
@@ -319,6 +319,9 @@ class AxxiumOAuthProxy(OAuthProxy):
             client = await ClientAuthenticator(self).authenticate_request(request)
         except AuthenticationError:
             return protected(JSONResponse({"error": "invalid_client"}, status_code=401))
+        except Exception:
+            return protected(JSONResponse({"error": "temporarily_unavailable",
+                "error_description": "Revocation state is unavailable. Retry this request."}, status_code=503))
         form = await request.form()
         raw = form.get("token")
         if not isinstance(raw, str) or not raw or form.get("token_type_hint") not in {None, "access_token", "refresh_token"}:
@@ -326,11 +329,19 @@ class AxxiumOAuthProxy(OAuthProxy):
         async with self._family_lock:
             token_hash = hashlib.sha256(raw.encode()).hexdigest()
             try:
-                payload, mapping = await self._revocation_family_for_token(raw, client.client_id)
+                payload = self._revocation_payload(raw, client.client_id)
+            except Exception:
+                # RFC 7009 deliberately does not disclose whether a token exists.
+                return protected(Response(status_code=200))
+            try:
+                mapping = await self._jti_mapping_store.get(key=payload["jti"])
                 pending = await self._pending_family(mapping.upstream_token_id) if mapping else None
                 upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id) if mapping else None
             except Exception:
-                return protected(Response(status_code=200))
+                # An unavailable store is not an unknown token. Report that
+                # the operation must be retried; do not falsely claim success.
+                return protected(JSONResponse({"error": "temporarily_unavailable",
+                    "error_description": "Revocation state is unavailable. Retry this request."}, status_code=503))
             if pending is None:
                 if not upstream or upstream.client_id != client.client_id:
                     return protected(Response(status_code=200))

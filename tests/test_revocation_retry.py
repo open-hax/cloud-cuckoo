@@ -110,6 +110,18 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
                     await auth.exchange_refresh_token(client_info, prevalidated_refresh, SCOPES)
             assert await auth.load_access_token(other["access_token"])
             assert await auth.load_refresh_token(await auth.get_client(other_client), other["refresh_token"])
+            # A durable-state read error must not masquerade as an unknown
+            # token and a successful central revocation.
+            async def unavailable_state(*args, **kwargs):
+                raise OSError("fixture revocation storage unavailable")
+            for target, method in [(auth._client_store, "get"), (auth._jti_mapping_store, "get"),
+                                   (auth, "_pending_family"), (auth._upstream_token_store, "get")]:
+                with monkeypatch.context() as m:
+                    m.setattr(target, method, unavailable_state)
+                    failed = await http.post(base + "/revoke", data={"client_id": client, "token": tokens["access_token"]})
+                    assert failed.status_code == 503
+                    assert await auth.load_access_token(tokens["access_token"]) is None
+                assert len(upstream_requests) == expected_calls
             # Another DCR client cannot finish this family's pending revocation.
             with monkeypatch.context() as m:
                 m.setattr(oauth, "httpx", SimpleNamespace(
