@@ -38,8 +38,8 @@ proposal/session inputs remain separate; no score or selection is fabricated.
 
 `integration` and `e2e` are explicit immutable manifest phases. Actual local
 HTTP/WebSocket/OAuth fixture tests may measure those phases with synthetic
-upstreams; they do not prove human login or Google execution. Source19e's two
-Authlib warnings must deny a clean baseline even if all tests exit0. A future
+upstreams; they do not prove human login or Google execution. Source 19e's two
+Authlib warnings must deny a clean baseline even if all tests exit 0. A future
 accepted warning-free source requires fresh source/producer/tool/harness custody
 and baseline/postrestore evidence before any genuine mutant pilot or campaign.
 
