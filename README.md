@@ -75,6 +75,14 @@ The registered callback is `https://knoxx.promethean.rest/colab/auth/callback`.
 The client secret is a service credential, never a human login credential.
 No credential file is provisioned until the central identity release is qualified.
 Wrong configuration stops startup; absence denies access without a substitute.
+Run only one gateway process against an OAuth state directory. Its token-family
+lock serializes authorization-code exchanges, refreshes and revocations within
+that process; it is not a distributed lock for multiple workers or replicas.
+If Axxium revocation is unavailable, the affected family is denied locally and
+the caller receives HTTP 503. Retry the same revocation request: the encrypted
+pending state survives a gateway restart and is cleared only after Axxium
+confirms both upstream credentials have been revoked. Other families are not
+revoked. A central logout or disabled actor also denies the next MCP request.
 The ChatGPT redirect remains enabled by default. To admit another harness,
 optionally add `allowed_client_redirect_uris` to the private client JSON as a
 list of exact callback URLs, for example `["http://127.0.0.1:9876/callback"]`.

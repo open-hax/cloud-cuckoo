@@ -4,6 +4,7 @@ FastMCP owns MCP OAuth/PKCE. Axxium owns login, actors and root sessions.
 Missing identity configuration denies access, including legacy keys.
 """
 import base64
+import asyncio
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -16,6 +17,7 @@ import time
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
+from authlib.jose import JsonWebToken
 from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
 from fastmcp.server.auth.auth import TokenHandler
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
@@ -23,7 +25,7 @@ import httpx
 from key_value.aio.stores.disk import DiskStore
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from mcp.server.auth.middleware.client_auth import AuthenticationError, ClientAuthenticator
-from mcp.server.auth.provider import AuthorizeError, RegistrationError
+from mcp.server.auth.provider import AuthorizeError, RegistrationError, TokenError
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 from mcp.server.auth.routes import cors_middleware, create_protected_resource_routes
@@ -203,6 +205,37 @@ class AxxiumTokenVerifier(TokenVerifier):
 class AxxiumOAuthProxy(OAuthProxy):
     """Only protocol adaptations to the pinned proxy, never a human login form."""
 
+    _pending_collection = "colab-pending-revocations"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # The deployed gateway is a single process. Serialize token-family
+        # refresh and revocation so a refresh cannot restore a revoked family.
+        self._family_lock = asyncio.Lock()
+
+    async def _family_for_token(self, token):
+        payload = self.jwt_issuer.verify_token(token)
+        mapping = await self._jti_mapping_store.get(key=payload["jti"])
+        return payload, mapping
+
+    async def _pending_family(self, family_id):
+        return await self._client_storage.get(key="family-" + family_id,
+                                              collection=self._pending_collection)
+
+    def _revocation_payload(self, token, client_id):
+        # Revocation may be retried after a short-lived access token expires.
+        # Verify the signature and fixed identities, but never use this path
+        # for access or refresh. The mapping is prolonged before marking a
+        # family pending, so it survives a crash without a separate index.
+        payload = JsonWebToken(["HS256"]).decode(token, self._jwt_signing_key)
+        if (payload.get("iss") != self.jwt_issuer.issuer or
+                payload.get("aud") != self.jwt_issuer.audience or
+                payload.get("client_id") != client_id or
+                not isinstance(payload.get("jti"), str) or not payload["jti"] or
+                payload.get("token_use") not in {None, "refresh"}):
+            raise ValueError("Invalid revocation credential")
+        return payload
+
     async def authorize(self, client, params):
         # MCP 1.30.0 cannot serialize FastMCP's invalid_target authorize error;
         # refuse a cross-resource request with the supported invalid_request code.
@@ -235,25 +268,49 @@ class AxxiumOAuthProxy(OAuthProxy):
         return OAuthClientInformationFull.model_validate(client.model_dump())
 
     async def load_access_token(self, token):
-        try:
-            if self.jwt_issuer.verify_token(token).get("token_use") is not None:
+        async with self._family_lock:
+            try:
+                payload, mapping = await self._family_for_token(token)
+                if payload.get("token_use") is not None or not mapping:
+                    return None
+                if await self._pending_family(mapping.upstream_token_id):
+                    return None
+            except Exception:
                 return None
-        except Exception:
-            return None
-        return await super().load_access_token(token)
+            return await super().load_access_token(token)
+
+    async def exchange_authorization_code(self, client, authorization_code):
+        # The SDK validates before this call; serialize its non-atomic
+        # read/delete so simultaneous requests cannot redeem the same code.
+        async with self._family_lock:
+            return await super().exchange_authorization_code(client, authorization_code)
 
     async def load_refresh_token(self, client, token):
-        try:
-            payload = self.jwt_issuer.verify_token(token)
-            if payload.get("token_use") != "refresh":
+        async with self._family_lock:
+            try:
+                payload, mapping = await self._family_for_token(token)
+                if payload.get("token_use") != "refresh" or not mapping:
+                    return None
+                if await self._pending_family(mapping.upstream_token_id):
+                    return None
+                upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id)
+                if not upstream or upstream.client_id != client.client_id:
+                    return None
+            except Exception:
                 return None
-            mapping = await self._jti_mapping_store.get(key=payload["jti"])
-            upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id) if mapping else None
-            if not upstream or upstream.client_id != client.client_id:
-                return None
-        except Exception:
-            return None
-        return await super().load_refresh_token(client, token)
+            return await super().load_refresh_token(client, token)
+
+    async def exchange_refresh_token(self, client, refresh_token, scopes):
+        async with self._family_lock:
+            try:
+                payload, mapping = await self._family_for_token(refresh_token.token)
+                if payload.get("token_use") != "refresh" or not mapping:
+                    raise ValueError("invalid refresh token")
+                if await self._pending_family(mapping.upstream_token_id):
+                    raise ValueError("revocation pending")
+            except Exception as exc:
+                raise TokenError("invalid_grant", "Refresh token unavailable") from exc
+            return await super().exchange_refresh_token(client, refresh_token, scopes)
 
     async def revoke_request(self, request):
         # MCP 1.30.0's revocation model requires client_secret for public clients.
@@ -262,31 +319,60 @@ class AxxiumOAuthProxy(OAuthProxy):
             client = await ClientAuthenticator(self).authenticate_request(request)
         except AuthenticationError:
             return protected(JSONResponse({"error": "invalid_client"}, status_code=401))
+        except Exception:
+            return protected(JSONResponse({"error": "temporarily_unavailable",
+                "error_description": "Revocation state is unavailable. Retry this request."}, status_code=503))
         form = await request.form()
         raw = form.get("token")
         if not isinstance(raw, str) or not raw or form.get("token_type_hint") not in {None, "access_token", "refresh_token"}:
             return protected(JSONResponse({"error": "invalid_request"}, status_code=400))
-        try:
-            payload = self.jwt_issuer.verify_token(raw)
-            mapping = await self._jti_mapping_store.get(key=payload["jti"])
-            upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id) if mapping else None
-        except Exception:
-            upstream = None
-        if upstream and upstream.client_id == client.client_id:
-            # Invalidate the entire local family even if central revocation fails.
-            await self._upstream_token_store.delete(key=upstream.upstream_token_id)
-            await self._jti_mapping_store.delete(key=payload["jti"])
-            await self._refresh_token_store.delete(key=hashlib.sha256(raw.encode()).hexdigest())
+        async with self._family_lock:
+            token_hash = hashlib.sha256(raw.encode()).hexdigest()
+            try:
+                payload = self._revocation_payload(raw, client.client_id)
+            except Exception:
+                # RFC 7009 deliberately does not disclose whether a token exists.
+                return protected(Response(status_code=200))
+            try:
+                mapping = await self._jti_mapping_store.get(key=payload["jti"])
+                pending = await self._pending_family(mapping.upstream_token_id) if mapping else None
+                upstream = await self._upstream_token_store.get(key=mapping.upstream_token_id) if mapping else None
+            except Exception:
+                # An unavailable store is not an unknown token. Report that
+                # the operation must be retried; do not falsely claim success.
+                return protected(JSONResponse({"error": "temporarily_unavailable",
+                    "error_description": "Revocation state is unavailable. Retry this request."}, status_code=503))
+            if pending is None:
+                if not upstream or upstream.client_id != client.client_id:
+                    return protected(Response(status_code=200))
+                pending = {"family_id": upstream.upstream_token_id, "client_id": upstream.client_id,
+                           "access_token": upstream.access_token, "refresh_token": upstream.refresh_token}
+                ttl = max(30 * 86400, int((upstream.refresh_token_expires_at or upstream.expires_at) - time.time()), 1)
+                # Extend only the lookup, never the credential's lifetime. If
+                # the process crashes before the marker is written, no state
+                # has been revoked and a retry can still find the same family.
+                await self._jti_mapping_store.put(key=payload["jti"], value=mapping, ttl=ttl)
+                # One encrypted record both denies the family and retains what
+                # is needed for central retry. There is no second alias write.
+                await self._client_storage.put(key="family-" + upstream.upstream_token_id, value=pending,
+                                               collection=self._pending_collection, ttl=ttl)
+            if not pending or pending["client_id"] != client.client_id:
+                return protected(Response(status_code=200))
             try:
                 async with httpx.AsyncClient(timeout=10, follow_redirects=False) as http:
-                    for token in filter(None, (upstream.refresh_token, upstream.access_token)):
+                    for token in filter(None, (pending["refresh_token"], pending["access_token"])):
                         response = await http.post(self._upstream_revocation_endpoint, data={
                             "client_id": self._upstream_client_id,
                             "client_secret": self._upstream_client_secret.get_secret_value(), "token": token})
                         response.raise_for_status()
             except httpx.HTTPError:
                 return protected(JSONResponse({"error": "temporarily_unavailable",
-                    "error_description": "Local access revoked; central revocation could not be confirmed."}, status_code=503))
+                    "error_description": "Local access revoked; central revocation could not be confirmed. Retry this request."}, status_code=503))
+            await self._upstream_token_store.delete(key=pending["family_id"])
+            if payload is not None:
+                await self._jti_mapping_store.delete(key=payload["jti"])
+            await self._refresh_token_store.delete(key=token_hash)
+            await self._client_storage.delete(key="family-" + pending["family_id"], collection=self._pending_collection)
         return protected(Response(status_code=200))
 
     def get_routes(self, mcp_path=None):
