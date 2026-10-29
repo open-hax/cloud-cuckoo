@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Build and publish a private source-bound image; never deploy a host."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+
+REPOSITORY = 'open-hax/cloud-cuckoo'
+IMAGE = 'ghcr.io/' + REPOSITORY
+HEX40 = re.compile(r'[0-9a-f]{40}\Z')
+HEX64 = re.compile(r'[0-9a-f]{64}\Z')
+
+SMOKE = r'''
+import asyncio
+import httpx
+from knoxx_colab_mcp.oauth import IdentityUnavailable, PUBLIC_BASE, SCOPES
+from knoxx_colab_mcp.server import make_server
+class Backend:
+    def status(self): return {'mode':'image-check','browser_connected':False}
+async def main():
+    app=make_server(Backend(),'fixture-denied-'+'x'*40,IdentityUnavailable()).http_app(stateless_http=True,json_response=True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://image-check') as c:
+        for path in ['/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/colab']:
+            response=await c.get(path)
+            assert response.status_code==200 and response.headers['cache-control']=='no-store'
+            data=response.json()
+            assert data['issuer']==PUBLIC_BASE and data['scopes_supported']==SCOPES
+            assert data['code_challenge_methods_supported']==['S256']
+        for path in ['/authorize','/consent','/register','/token','/revoke','/auth/callback']:
+            assert (await c.post(path,data={})).status_code==503
+        for key in ['', 'wrong', 'fixture-denied-'+'x'*40]:
+            headers={'Authorization':'Bearer '+key} if key else {}
+            assert (await c.post('/mcp',headers=headers,json={})).status_code==401
+        assert (await c.get('/health')).json()['identity_available'] is False
+    print('pending contract verified')
+asyncio.run(main())
+'''
+
+
+class Refusal(Exception):
+    pass
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run(command, *, input=None, env=None, timeout=900, stdout=subprocess.PIPE):
+    result = subprocess.run(command, input=input, env=env, stdout=stdout,
+                            stderr=subprocess.PIPE, timeout=timeout, check=False)
+    if result.returncode:
+        raise Refusal('A bounded build or publication command failed')
+    return result.stdout or b''
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def github(path, *, missing=False):
+    token = os.environ.get('GH_TOKEN')
+    if not token:
+        raise Refusal('The job-scoped GitHub token is unavailable')
+    request = urllib.request.Request('https://api.github.com/' + path, headers={
+        'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'cloud-cuckoo-image-builder'})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
+            payload = response.read(2 * 1024 * 1024 + 1)
+            if len(payload) > 2 * 1024 * 1024:
+                raise Refusal('GitHub metadata exceeded its bound')
+            return json.loads(payload)
+    except urllib.error.HTTPError as error:
+        if missing and error.code == 404:
+            return None
+        raise Refusal('Required GitHub metadata is unavailable') from None
+
+
+def context():
+    if (os.environ.get('GITHUB_REPOSITORY') != REPOSITORY or
+            os.environ.get('GITHUB_REF') != 'refs/heads/main' or
+            os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'):
+        raise Refusal('Only a manual main-branch run of the private source repository is supported')
+    workflow_sha = os.environ.get('GITHUB_SHA', '')
+    run_id = os.environ.get('GITHUB_RUN_ID', '')
+    attempt = os.environ.get('GITHUB_RUN_ATTEMPT', '')
+    if not HEX40.fullmatch(workflow_sha) or not run_id.isdecimal() or not attempt.isdecimal() or min(int(run_id), int(attempt)) < 1:
+        raise Refusal('The native workflow identity is invalid')
+    return {'repository': REPOSITORY, 'workflow_sha': workflow_sha,
+            'run_id': int(run_id), 'run_attempt': int(attempt)}
+
+
+def private_repository(api):
+    data = api('repos/' + REPOSITORY)
+    if (data.get('full_name') != REPOSITORY or data.get('private') is not True or
+            data.get('default_branch') != 'main'):
+        raise Refusal('The source repository must remain private with main as its default')
+
+
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, sort_keys=True, indent=2) + '\n')
+    Path(path).chmod(0o600)
+
+
+def emit(name, value):
+    if output := os.environ.get('GITHUB_OUTPUT'):
+        with Path(output).open('a') as stream:
+            stream.write(name + '=' + str(value) + '\n')
+
+
+def extract(archive, directory):
+    Path(directory).mkdir(parents=True, exist_ok=False)
+    with tarfile.open(archive) as source:
+        source.extractall(directory, filter='data')
+
+
+def admit(source_sha, checkout, archive, test_directory, receipt, *, api=github, command=run):
+    native = context()
+    if not HEX40.fullmatch(source_sha):
+        raise Refusal('An explicit full lowercase merged source SHA is required')
+    private_repository(api)
+    head = command(['git', '-C', str(checkout), 'rev-parse', 'HEAD']).decode().strip()
+    if head != native['workflow_sha']:
+        raise Refusal('The builder checkout differs from the native workflow revision')
+    command(['git', '-C', str(checkout), 'cat-file', '-e', source_sha + '^{commit}'])
+    command(['git', '-C', str(checkout), 'merge-base', '--is-ancestor', source_sha, head])
+    pulls = api(f'repos/{REPOSITORY}/commits/{source_sha}/pulls?per_page=100')
+    matching = [p for p in pulls if p.get('merged_at') and p.get('merge_commit_sha') == source_sha and
+                p.get('base', {}).get('ref') == 'main' and p.get('base', {}).get('repo', {}).get('full_name') == REPOSITORY]
+    if len(matching) != 1 or type(matching[0].get('number')) is not int:
+        raise Refusal('Source must be the actual merge commit of one accepted main PR')
+    with Path(archive).open('xb') as stream:
+        command(['git', '-C', str(checkout), 'archive', '--format=tar', source_sha], stdout=stream)
+    Path(archive).chmod(0o600)
+    data = {'schema': 'cloud-cuckoo-image/v1', **native, 'source_sha': source_sha,
+            'source_pr': matching[0]['number'], 'source_archive_sha256': sha256(archive)}
+    write_json(receipt, data)
+    extract(archive, test_directory)
+
+
+def tests_passed(report):
+    root = ET.parse(report).getroot()
+    suites = [node for node in root.iter('testsuite') if not node.findall('testsuite')]
+    counts = {key: sum(int(node.get(key, '0')) for node in suites) for key in ['tests', 'failures', 'errors', 'skipped']}
+    if counts['tests'] < 22 or any(counts[key] for key in ['failures', 'errors', 'skipped']):
+        raise Refusal('The complete source suite must pass at least 22 tests without errors or skips')
+    return counts
+
+
+def image_record(image, command):
+    record = json.loads(command(['docker', 'image', 'inspect', image]))
+    if not isinstance(record, list) or len(record) != 1:
+        raise Refusal('Image identity could not be resolved')
+    return record[0]
+
+
+def validate_image(record, source_sha, expected_id=None):
+    image_id = record.get('Id', '')
+    config = record.get('Config', {})
+    labels = config.get('Labels', {})
+    if (not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id) or
+            (expected_id is not None and image_id != expected_id) or config.get('User') != '1000:1000' or
+            labels.get('org.opencontainers.image.source') != 'https://github.com/' + REPOSITORY or
+            labels.get('org.opencontainers.image.revision') != source_sha):
+        raise Refusal('The image does not match the selected source and nonroot contract')
+    return image_id
+
+
+def image_tag(data):
+    return f"{IMAGE}:source-{data['source_sha']}-run-{data['run_id']}-attempt-{data['run_attempt']}"
+
+
+def build(archive, receipt, report, build_directory, output, *, command=run):
+    data = json.loads(Path(receipt).read_text())
+    if any(data.get(key) != value for key, value in context().items()) or sha256(archive) != data['source_archive_sha256']:
+        raise Refusal('Source archive or native build identity changed')
+    counts = tests_passed(report)
+    extract(archive, build_directory)  # Fresh context: test caches/venv never enter the build.
+    tag = image_tag(data)
+    command(['docker', 'build', '--build-arg', 'SOURCE_REVISION=' + data['source_sha'], '--tag', tag, str(build_directory)])
+    image_id = validate_image(image_record(tag, command), data['source_sha'])
+    command(['docker', 'run', '--rm', '-i', '--pull', 'never', '--network', 'none', '--read-only',
+             '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+             '--pids-limit', '64', '--memory', '512m', '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
+             image_id, 'python', '-'], input=SMOKE.encode(), timeout=180)
+    Path(output).mkdir(parents=True, exist_ok=False)
+    image_archive = Path(output) / 'image.tar'
+    command(['docker', 'save', '--output', str(image_archive), tag])
+    data.update({'image_id': image_id, 'image_tag': tag, 'docker_archive_sha256': sha256(image_archive),
+                 'tests': counts, 'pending_smoke': 'passed'})
+    write_json(Path(output) / 'build.json', data)
+    emit('image_id', image_id)
+    emit('docker_archive_sha256', data['docker_archive_sha256'])
+
+
+def private_package(data, *, permit_missing=False):
+    # GitHub documents first publication as private. A 404 is retained as
+    # absent-or-inaccessible, never asserted to prove absence. Existing visible
+    # packages must already be private and linked to this repository.
+    if data is None and permit_missing:
+        return
+    if (not isinstance(data, dict) or data.get('visibility') != 'private' or
+            not isinstance(data.get('repository'), dict) or
+            data['repository'].get('full_name') != REPOSITORY):
+        raise Refusal('Package privacy and source association are not verified')
+
+
+def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expected_image_id, output,
+            *, api=github, command=run, pause=time.sleep):
+    native = context()
+    private_repository(api)
+    if not artifact_id.isdecimal() or not HEX64.fullmatch(artifact_digest):
+        raise Refusal('The native build artifact identity is invalid')
+    artifact = api(f'repos/{REPOSITORY}/actions/artifacts/{artifact_id}')
+    if (artifact.get('expired') is not False or artifact.get('digest') != 'sha256:' + artifact_digest or
+            artifact.get('workflow_run', {}).get('id') != native['run_id'] or
+            artifact.get('workflow_run', {}).get('head_sha') != native['workflow_sha']):
+        raise Refusal('The downloaded artifact is not bound to this builder run')
+    data = json.loads((Path(directory) / 'build.json').read_text())
+    if (data.get('schema') != 'cloud-cuckoo-image/v1' or
+            any(data.get(key) != value for key, value in native.items()) or
+            not HEX40.fullmatch(data.get('source_sha', '')) or data.get('pending_smoke') != 'passed' or
+            data.get('image_id') != expected_image_id or data.get('docker_archive_sha256') != expected_archive_sha or
+            data.get('image_tag') != image_tag(data) or
+            sha256(Path(directory) / 'image.tar') != expected_archive_sha):
+        raise Refusal('The build artifact content or source receipt changed')
+    private_package(api('orgs/open-hax/packages/container/cloud-cuckoo', missing=True), permit_missing=True)
+    command(['docker', 'load', '--input', str(Path(directory) / 'image.tar')])
+    validate_image(image_record(expected_image_id, command), data['source_sha'], expected_image_id)
+    tag = image_tag(data)
+    command(['docker', 'tag', expected_image_id, tag])
+    token = os.environ.get('GH_TOKEN', '')
+    actor = os.environ.get('GITHUB_ACTOR', '')
+    if not token or not actor:
+        raise Refusal('The ephemeral publishing identity is unavailable')
+    with tempfile.TemporaryDirectory(prefix='cloud-cuckoo-ghcr-') as auth:
+        docker_env = {key: value for key, value in os.environ.items() if key not in {'GH_TOKEN', 'GITHUB_TOKEN'}}
+        docker_env['DOCKER_CONFIG'] = auth
+        try:
+            command(['docker', 'login', 'ghcr.io', '--username', actor, '--password-stdin'], input=token.encode(), env=docker_env, timeout=60)
+            result = command(['docker', 'push', tag], env=docker_env)
+            digests = set(re.findall(rb'\bdigest: (sha256:[0-9a-f]{64})\b', result))
+            if len(digests) != 1:
+                raise Refusal('The registry did not return exactly one image digest')
+            digest = digests.pop().decode()
+            reference = IMAGE + '@' + digest
+            command(['docker', 'pull', reference], env=docker_env)
+            validate_image(image_record(reference, lambda args: command(args, env=docker_env)), data['source_sha'], expected_image_id)
+            data.update({'image_digest': digest, 'image_reference': reference,
+                         'build_artifact_id': int(artifact_id), 'build_artifact_digest': 'sha256:' + artifact_digest,
+                         'published_at': datetime.now(timezone.utc).isoformat(), 'metadata_verified': False})
+            write_json(output, data)
+            for attempt in range(3):
+                package = api('orgs/open-hax/packages/container/cloud-cuckoo', missing=True)
+                if package is not None:
+                    private_package(package)
+                    break
+                if attempt == 2:
+                    raise Refusal('Published package metadata remains unavailable')
+                pause(2)
+            data.update({'package_visibility': 'private', 'metadata_verified': True})
+            write_json(output, data)
+            emit('image_reference', reference)
+        finally:
+            try:
+                command(['docker', 'logout', 'ghcr.io'], env=docker_env, timeout=30)
+            except Refusal:
+                pass  # The containing auth directory is removed unconditionally.
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='mode', required=True)
+    admit_args = sub.add_parser('admit')
+    for name in ['source-sha', 'checkout', 'archive', 'test-directory', 'receipt']:
+        admit_args.add_argument('--' + name, required=True)
+    build_args = sub.add_parser('build')
+    for name in ['archive', 'receipt', 'report', 'build-directory', 'output']:
+        build_args.add_argument('--' + name, required=True)
+    publish_args = sub.add_parser('publish')
+    for name in ['directory', 'artifact-id', 'artifact-digest', 'expected-archive-sha', 'expected-image-id', 'output']:
+        publish_args.add_argument('--' + name, required=True)
+    args = vars(parser.parse_args())
+    mode = args.pop('mode')
+    try:
+        globals()[mode](**args)
+        print('Cloud Cuckoo image step completed: ' + mode)
+        return 0
+    except (Refusal, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, ET.ParseError, tarfile.TarError):
+        print('Cloud Cuckoo image step refused; no credential or captured subprocess output is logged', flush=True)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

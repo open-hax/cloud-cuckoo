@@ -126,6 +126,33 @@ Deployment definitions and rollback instructions belong to the Services repo:
 `services/digitalocean/services/colab-mcp/`. The feature verification guide is
 `knoxx/docs/verification/colab-mcp.md`.
 
+The source repository owns the manual **Publish private Cloud Cuckoo image**
+workflow. Run it on `main` with `source_sha` set to a full commit SHA that GitHub
+identifies as the merge commit of an accepted PR into `main`. The contents-read
+build job first tests the current controller's publication boundaries in a clean
+environment, including when the selected application source predates that
+controller. It then tests archived tracked source separately, retains both test
+reports, and builds a fresh archive context with that SHA in
+`SOURCE_REVISION`, and checks the actual image as user `1000:1000` with a read-only
+filesystem and no network. The pending identity smoke must preserve discovery,
+HTTP 503 for grant routes, HTTP 401 for MCP calls, and `identity_available: false`.
+
+An isolated publication job uses only the repository's ephemeral `GITHUB_TOKEN`
+to push `ghcr.io/open-hax/cloud-cuckoo` under a source/run/attempt tag. Visible
+existing packages must be private and associated with this repository. GitHub
+creates a first package privately; the workflow verifies actual package metadata
+after publication and refuses to claim successful privacy verification when it
+cannot read that metadata. It records the immutable image digest, OCI source and
+revision, test/image checks, native workflow identity, and build artifact digest
+in the `cloud-cuckoo-release-<run>-<attempt>` artifact. A failed post-publication
+metadata check can leave a pushed image with an explicitly unverified receipt.
+This workflow does not deploy or access host, human, or Google credentials.
+
+Services consumes the resulting immutable `ghcr.io/open-hax/cloud-cuckoo@sha256:…`
+reference and the same merged source SHA. The private package must grant Actions
+read access to `open-hax/services` before a Services workflow can pull it with its
+own ephemeral token; no owner access token belongs in either workflow.
+
 Live Colab execution requires a human-approved browser connection and an actual
 runtime. Fixture transport tests, HTTP health, plugin creation, and capability
 validation each prove only their respective layer.
