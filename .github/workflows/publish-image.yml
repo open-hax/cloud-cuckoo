@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 25
     permissions:
       contents: read
+      pull-requests: read
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
