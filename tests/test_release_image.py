@@ -268,3 +268,45 @@ def test_main_failure_never_logs_captured_secret(monkeypatch, capsys):
     monkeypatch.setattr(release, 'admit', failed)
     assert release.main() == 1
     assert 'fixture-sensitive-subprocess-output' not in capsys.readouterr().out
+
+
+def test_probe_projects_only_native_visibility_and_link(tmp_path, capsys):
+    def api(path, **kwargs):
+        return PRIVATE_REPO if path == 'repos/' + release.REPOSITORY else {
+            **PRIVATE_PACKAGE, 'fixture_extra_sensitive': 'must-not-be-logged'}
+    receipt = tmp_path / 'probe.json'
+    release.probe(receipt, api=api)
+    data = json.loads(receipt.read_text())
+    assert data['metadata_verified'] is False
+    assert data['observations'] == [{'api_version': version, 'http_status': 200,
+        'visibility': 'private', 'linked_repository': release.REPOSITORY} for version in ['2022-11-28', '2026-03-10']]
+    assert 'must-not-be-logged' not in receipt.read_text() + capsys.readouterr().out
+
+
+def test_probe_preserves_unavailable_metadata_as_unknown(tmp_path):
+    def api(path, **kwargs):
+        if path == 'repos/' + release.REPOSITORY:
+            return PRIVATE_REPO
+        raise release.MetadataUnavailable(403)
+    receipt = tmp_path / 'probe.json'
+    release.probe(receipt, api=api)
+    data = json.loads(receipt.read_text())
+    assert all(o['http_status'] == 403 and o['visibility'] is None and o['linked_repository'] is None
+               for o in data['observations'])
+
+
+def test_probe_missing_link_is_not_a_source_association_claim(tmp_path):
+    def api(path, **kwargs):
+        return PRIVATE_REPO if path == 'repos/' + release.REPOSITORY else {'visibility': 'private'}
+    receipt = tmp_path / 'probe.json'
+    release.probe(receipt, api=api)
+    assert all(o['visibility'] == 'private' and o['linked_repository'] is None
+               for o in json.loads(receipt.read_text())['observations'])
+
+
+def test_probe_cannot_run_outside_main_before_metadata_request(tmp_path, monkeypatch):
+    monkeypatch.setenv('GITHUB_REF', 'refs/heads/topic')
+    def forbidden(*args, **kwargs):
+        pytest.fail('Unaccepted context reached package API')
+    with pytest.raises(release.Refusal):
+        release.probe(tmp_path / 'probe.json', api=forbidden)

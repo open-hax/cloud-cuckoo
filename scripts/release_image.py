@@ -51,6 +51,12 @@ class Refusal(Exception):
     pass
 
 
+class MetadataUnavailable(Refusal):
+    def __init__(self, status):
+        super().__init__('Required GitHub metadata is unavailable')
+        self.status = status
+
+
 def sha256(path):
     digest = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -72,13 +78,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def github(path, *, missing=False):
+def github(path, *, missing=False, api_version='2022-11-28'):
     token = os.environ.get('GH_TOKEN')
     if not token:
         raise Refusal('The job-scoped GitHub token is unavailable')
     request = urllib.request.Request('https://api.github.com/' + path, headers={
         'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'cloud-cuckoo-image-builder'})
+        'X-GitHub-Api-Version': api_version, 'User-Agent': 'cloud-cuckoo-image-builder'})
     try:
         with urllib.request.build_opener(NoRedirect).open(request, timeout=20) as response:
             payload = response.read(2 * 1024 * 1024 + 1)
@@ -88,7 +94,7 @@ def github(path, *, missing=False):
     except urllib.error.HTTPError as error:
         if missing and error.code == 404:
             return None
-        raise Refusal('Required GitHub metadata is unavailable') from None
+        raise MetadataUnavailable(error.code) from None
 
 
 def context():
@@ -223,6 +229,35 @@ def private_package(data, *, permit_missing=False):
         raise Refusal('Package privacy and source association are not verified')
 
 
+def probe(output, *, api=github):
+    """Observe native package metadata without building, pushing or qualifying it."""
+    native = context()
+    private_repository(api)
+    observations = []
+    for version in ['2022-11-28', '2026-03-10']:
+        try:
+            data = api('orgs/open-hax/packages/container/cloud-cuckoo', api_version=version)
+        except MetadataUnavailable as error:
+            observations.append({'api_version': version, 'http_status': error.status,
+                                 'visibility': None, 'linked_repository': None})
+            continue
+        if not isinstance(data, dict):
+            raise Refusal('Package metadata shape is unavailable')
+        repository = data.get('repository')
+        linked = repository.get('full_name') if isinstance(repository, dict) else None
+        if not isinstance(linked, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', linked):
+            linked = None
+        visibility = data.get('visibility')
+        if visibility not in ['private', 'public', 'internal']:
+            visibility = None
+        observations.append({'api_version': version, 'http_status': 200,
+                             'visibility': visibility, 'linked_repository': linked})
+    data = {'schema': 'cloud-cuckoo-package-probe/v1', **native,
+            'metadata_verified': False, 'observations': observations}
+    write_json(output, data)
+    print(json.dumps(data, sort_keys=True), flush=True)
+
+
 def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expected_image_id, output,
             *, api=github, command=run, pause=time.sleep):
     native = context()
@@ -298,6 +333,8 @@ def main():
     publish_args = sub.add_parser('publish')
     for name in ['directory', 'artifact-id', 'artifact-digest', 'expected-archive-sha', 'expected-image-id', 'output']:
         publish_args.add_argument('--' + name, required=True)
+    probe_args = sub.add_parser('probe')
+    probe_args.add_argument('--output', required=True)
     args = vars(parser.parse_args())
     mode = args.pop('mode')
     try:
