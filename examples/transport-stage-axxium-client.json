@@ -1,0 +1,7 @@
+{
+  "id": "knoxx-colab-transport-staging",
+  "secret": "UNSET",
+  "redirect-uris": ["http://127.0.0.1:18771/auth/callback"],
+  "refresh-enabled?": true,
+  "device-enabled?": false
+}

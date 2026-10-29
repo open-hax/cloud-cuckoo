@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 import webbrowser
 
 from colab_mcp.session import ColabProxyClient
@@ -24,6 +25,9 @@ from starlette.responses import JSONResponse
 UPSTREAM_REVISION = "b9ab3899e0f1fa493390b1fd6d54aa2e464ecdf1"
 TOOL_NAMES = ["colab_status", "colab_connect", "colab_tools", "colab_call"]
 MAX_ARGUMENT_BYTES = 262144
+TRANSPORT_STAGE_TOKEN = Path('/run/colab-transport-stage/fixture-token')
+TRANSPORT_STAGE_CLIENT = Path('/run/colab-transport-stage/axxium-client.json')
+TRANSPORT_STAGE_STATE = Path('/var/lib/colab-transport-stage')
 
 
 def read_secret(path: str) -> str:
@@ -159,15 +163,45 @@ class StagingBackend:
         raise ValueError("Staging identity probe cannot execute Colab operations")
 
 
+class TransportStagingGateway(Gateway):
+    """Use the production forwarding code with compiled-in synthetic upstreams."""
+    synthetic_upstreams = True
+
+    def __init__(self, token):
+        super().__init__('http://127.0.0.1:18773/mcp', token, 'http://127.0.0.1:18775/mcp')
+
+    async def status(self):
+        result = await super().status()
+        result.update(mode='transport-stage-gateway', synthetic_upstreams=True, execution_verified=False)
+        return result
+
+
+def read_transport_stage_token(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError('Transport-stage fixture token must be an owned regular private file')
+    return read_secret(str(path))
+
+
+def validate_transport_fixture_binding(profile, role, host, port):
+    if (profile != 'transport-staging' or role not in {'bridge', 'compute'} or host != '127.0.0.1' or
+            port != {'bridge': 18773, 'compute': 18775}.get(role)):
+        raise ValueError('Transport-stage fixtures require their fixed isolated loopback listener')
+
+
 def validate_gateway_binding(profile, host, port):
     if profile == "staging" and (host != "127.0.0.1" or port != 18761):
         raise ValueError("Staging gateway must bind 127.0.0.1:18761")
+    if profile == 'transport-staging' and (host != '127.0.0.1' or port != 18771):
+        raise ValueError('Transport-stage gateway must bind 127.0.0.1:18771')
 
 
 def gateway_backend(profile, environ):
     """Staging cannot read or forward to the production bridge or compute."""
     if profile == "staging":
         return StagingBackend()
+    if profile == 'transport-staging':
+        return TransportStagingGateway(read_transport_stage_token(TRANSPORT_STAGE_TOKEN))
     if profile != "production":
         raise ValueError("Unknown Colab authentication profile")
     return Gateway(environ["COLAB_BRIDGE_URL"], read_secret(environ["COLAB_BRIDGE_TOKEN_FILE"]),
@@ -194,6 +228,8 @@ def make_server(backend, token: str, auth=None) -> FastMCP:
         """Use this for safe connection instructions. The human opens the local browser; no Google credentials or connection tokens are returned."""
         if isinstance(backend, StagingBackend):
             return {"host": "local", "instructions": "This staging identity probe cannot connect to Colab."}
+        if getattr(backend, 'synthetic_upstreams', False):
+            return {'synthetic_upstreams': True, 'instructions': 'Synthetic transport stage only; no Google browser or runtime is connected.'}
         return {"host": "Stealth", "command": "knoxx-colab-mcp open-browser",
                 "instructions": "Run from the installed Colab MCP environment on Stealth. Sign into Google in the opened Colab tab, accept its MCP connection, then call colab_status. The browser must remain open."}
 
@@ -217,11 +253,22 @@ def make_server(backend, token: str, auth=None) -> FastMCP:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["bridge", "gateway", "open-browser"])
+    parser.add_argument("mode", choices=["bridge", "gateway", "open-browser", 'transport-stage-bridge', 'transport-stage-compute'])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8023)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/knoxx-colab")
     args = parser.parse_args()
+    profile_name = os.environ.get("COLAB_AUTH_PROFILE", "production")
+    if args.mode.startswith('transport-stage-'):
+        from knoxx_colab_mcp.transport_stage import make_fixture_server
+        role = args.mode.removeprefix('transport-stage-')
+        validate_transport_fixture_binding(profile_name, role, args.host, args.port)
+        server = make_fixture_server(role, read_transport_stage_token(TRANSPORT_STAGE_TOKEN))
+        server.run(transport='http', host=args.host, port=args.port, stateless_http=True,
+                   json_response=True, show_banner=False, log_level='warning')
+        return
+    if profile_name == 'transport-staging' and args.mode in {'bridge', 'open-browser'}:
+        raise ValueError('Transport staging cannot start or open a Google browser bridge')
     if args.mode == "open-browser":
         url = (args.state_dir / "browser-url").read_text().strip()
         if not url.startswith(f"{COLAB}{SCRATCH_PATH}#mcpProxyToken="):
@@ -230,17 +277,20 @@ def main():
             raise SystemExit("No browser opened. Run this command in the graphical Stealth session.")
         return
     token = read_secret(os.environ["COLAB_MCP_TOKEN_FILE"]) if args.mode == "bridge" else ""
-    profile_name = os.environ.get("COLAB_AUTH_PROFILE", "production")
     if args.mode == "gateway":
         validate_gateway_binding(profile_name, args.host, args.port)
     backend = BrowserBridge(args.state_dir) if args.mode == "bridge" else gateway_backend(profile_name, os.environ)
     auth = None
     if args.mode == "gateway":
         from knoxx_colab_mcp.oauth import auth_profile, make_gateway_auth
-        config_path = os.environ.get("COLAB_AXXIUM_CLIENT_FILE")
-        auth = make_gateway_auth(os.environ["COLAB_OAUTH_BASE_URL"],
-                                 Path(os.environ["COLAB_OAUTH_STATE_DIR"]),
-                                 Path(config_path) if config_path else None, auth_profile(profile_name))
+        profile = auth_profile(profile_name)
+        if profile_name == 'transport-staging':
+            auth = make_gateway_auth(profile.base_url, TRANSPORT_STAGE_STATE, TRANSPORT_STAGE_CLIENT, profile)
+        else:
+            config_path = os.environ.get("COLAB_AXXIUM_CLIENT_FILE")
+            auth = make_gateway_auth(os.environ["COLAB_OAUTH_BASE_URL"],
+                                     Path(os.environ["COLAB_OAUTH_STATE_DIR"]),
+                                     Path(config_path) if config_path else None, profile)
     server = make_server(backend, token, auth=auth)
     server.run(transport="http", host=args.host, port=args.port,
                stateless_http=True, json_response=True, show_banner=False, log_level="warning")

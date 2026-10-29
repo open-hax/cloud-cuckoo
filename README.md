@@ -227,3 +227,52 @@ other bind addresses and ports, uses a non-executing fixture backend, and never
 reads bridge or compute credentials. It proves only the identity and MCP transport
 path; it cannot access an actual Colab notebook or allocate compute. Production
 remains the default and retains its existing pinned issuer and callback.
+
+## Transport staging
+
+`transport-staging` is a separate protocol stage that exercises the production
+`Gateway.forward` implementation and the same Axxium OAuth proxy against two
+dedicated synthetic MCP peers. Its upstreams are fixtures: it cannot connect a
+Google browser, execute Python, allocate compute, cancel a real job or report an
+actual balance. The older `staging` profile remains an identity-only probe and
+does not supply a transport-stage deployment or production promotion record.
+
+The closed profile has fixed loopback listeners:
+
+| Role | Command and port |
+| --- | --- |
+| Gateway | `knoxx-colab-mcp gateway --host 127.0.0.1 --port 18771` |
+| Bridge fixture | `knoxx-colab-mcp transport-stage-bridge --host 127.0.0.1 --port 18773` |
+| Compute fixture | `knoxx-colab-mcp transport-stage-compute --host 127.0.0.1 --port 18775` |
+
+All three require `COLAB_AUTH_PROFILE=transport-staging`. The fixtures and the
+gateway read only `/run/colab-transport-stage/fixture-token`, a private regular
+file owned by their runtime UID. The gateway uses the fixed private client file
+`/run/colab-transport-stage/axxium-client.json` and state directory
+`/var/lib/colab-transport-stage`. Production backend, client, base URL and OAuth
+state environment variables do not override these paths. Other listener
+interfaces and ports are refused; Google bridge and browser-opening modes are
+refused under this profile.
+
+Register the dedicated Axxium staging client from
+`examples/transport-stage-axxium-client.json`, with its exact loopback callback,
+and install a private gateway configuration shaped like
+`examples/transport-stage-gateway-client.json`. The examples are inert: `UNSET`
+is not a valid credential and the example actor is synthetic. The actual stage
+configuration must select an existing permitted staging actor; it does not
+provision a human account. Neither the production client secret nor a Google
+credential belongs in this stage.
+
+The bridge fixture exposes only a discovered `fixture_echo` read call. Compute
+status, usage and sessions are visibly synthetic, with no actual balance or
+session; start, job and cancellation calls fail without execution. The tests
+exercise real HTTP MCP initialization/discovery/forwarding, errors, typed
+compute transport, the actual gateway OAuth registration/PKCE/token boundary,
+wrong-resource denial, code replay denial and central-token revocation. The
+upstream grant and introspection responses used by those tests are synthetic;
+they do not prove a human sign-in or a live Colab session.
+
+Services must create and verify a new source/image-bound deployment record for
+this stage before production promotion. Publishing the image or passing these
+fixture tests does not itself create that record or replace full integration,
+end-to-end and mutation qualification.
