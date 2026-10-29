@@ -1,0 +1,6 @@
+{
+  "issuer": "https://axxium.promethean.rest/oidc",
+  "client_id": "knoxx-colab",
+  "client_secret": "UNSET",
+  "allowed_subjects": ["actor_00000000-0000-4000-8000-000000000001"]
+}
