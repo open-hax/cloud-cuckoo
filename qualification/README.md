@@ -42,3 +42,12 @@ upstreams; they do not prove human login or Google execution. Source19e's two
 Authlib warnings must deny a clean baseline even if all tests exit0. A future
 accepted warning-free source requires fresh source/producer/tool/harness custody
 and baseline/postrestore evidence before any genuine mutant pilot or campaign.
+
+The source CI workflow installs `uv.lock` with the project test extra, which
+contains pytest and pytest-asyncio. Cosmic Ray inventory uses a separate tooling
+environment; it is not the application test interpreter. PR/main CI runs both
+the adversarial controls and the full source suite on an ephemeral runner with
+read-only repository permission, stripped test environments, fresh cache
+prefixes and a 2 GiB / 2 CPU systemd resource boundary. It retains raw streams,
+JUnit reports and each control invocation. A passing CI test job does not erase
+recorded dependency warnings or grant production qualification.
