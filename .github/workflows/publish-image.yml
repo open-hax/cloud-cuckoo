@@ -1,4 +1,4 @@
-name: Publish private Cloud Cuckoo image
+name: Publish Cloud Cuckoo image
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
 
 permissions: {}
 concurrency:
-  group: cloud-cuckoo-private-image-publication
+  group: cloud-cuckoo-image-publication
   cancel-in-progress: false
 
 jobs:

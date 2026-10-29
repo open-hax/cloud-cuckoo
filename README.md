@@ -1,6 +1,6 @@
 # Cloud Cuckoo
 
-Cloud Cuckoo is OpenHAX’s private Colab MCP bridge: a cuckoo carrying agent requests into Google’s cloud notebooks and compute runtimes. It extracts the existing `knoxx/integrations/colab-mcp` 0.4.0 implementation without changing its wire protocol or command names. The implementation initially existed as uncommitted Knoxx source; the running gateway’s three Python modules were byte-matched to this extraction on 2026-10-28. Deployment and authenticated access remain separate from this source snapshot.
+Cloud Cuckoo is OpenHAX’s GPL-3.0-or-later Colab MCP bridge: a cuckoo carrying agent requests into Google’s cloud notebooks and compute runtimes. It extracts the existing `knoxx/integrations/colab-mcp` 0.4.0 implementation without changing its wire protocol or command names. The implementation initially existed as uncommitted Knoxx source; the running gateway’s three Python modules were byte-matched to this extraction on 2026-10-28. Deployment and authenticated access remain separate from this source snapshot.
 
 This package is a Python **transport boundary** around Google's official
 [`googlecolab/colab-mcp`](https://github.com/googlecolab/colab-mcp), pinned to
@@ -120,13 +120,15 @@ through Axxium when needed. Harnesses choosing ephemeral loopback ports need a
 fixed callback configuration compatible with this exact policy.
 Run `.venv/bin/python verify_oauth.py` for read-only identity preflight; exit 2
 means the shared issuer is pending. It never submits credentials or approves
-human consent. Do not publicly share this single-operator package.
+human consent. Source is public under GPL-3.0-or-later; container distribution
+targets public visibility. Deployment credentials and account-specific OAuth
+state remain host-local.
 
 Deployment definitions and rollback instructions belong to the Services repo:
 `services/digitalocean/services/colab-mcp/`. The feature verification guide is
 `knoxx/docs/verification/colab-mcp.md`.
 
-The source repository owns the manual **Publish private Cloud Cuckoo image**
+The source repository owns the manual **Publish Cloud Cuckoo image**
 workflow. Run it on `main` with `source_sha` set to a full commit SHA that GitHub
 identifies as the merge commit of an accepted PR into `main`. The contents-read
 build job first tests the current controller's publication boundaries in a clean
@@ -139,10 +141,13 @@ HTTP 503 for grant routes, HTTP 401 for MCP calls, and `identity_available: fals
 
 An isolated publication job uses only the repository's ephemeral `GITHUB_TOKEN`
 to push `ghcr.io/open-hax/cloud-cuckoo` under a source/run/attempt tag. Visible
-existing packages must match the exact owner/name/type and remain private. GitHub
-creates a first package privately; the workflow verifies actual package metadata
-after publication and refuses to claim successful privacy verification when it
-cannot read that metadata. It records the immutable image digest, OCI source and
+existing packages must match the exact owner/name/type. Public distribution is
+the authorized target. GitHub initially creates a package privately; while an
+organization policy blocks the transition, a private image remains an explicitly
+recorded intermediate state. Internal and unknown visibility are refused. The
+workflow reads actual package metadata after publication and records observed
+visibility. `public_release_complete` is true only for public metadata followed
+by a successful anonymous immutable digest pull using an empty auth directory. It records the immutable image digest, OCI source and
 revision, test/image checks, native workflow identity, and build artifact digest
 in the `cloud-cuckoo-release-<run>-<attempt>` artifact. A failed post-publication
 metadata check can leave a pushed image with an explicitly unverified receipt.
@@ -153,20 +158,24 @@ accepted source SHA, and actual pulled digest/image ID/OCI labels. GitHub's GHCR
 REST metadata omits a documented repository-link field, and GHCR is unsupported
 by the Packages GraphQL API. The package's UI repository link is therefore
 recorded as `unknown`; it is not substituted for image provenance. Package
-visibility must still be verified as `private` from native metadata.
+visibility must be read from native metadata. A private intermediate image is
+not a completed public release. Every new image contains the full project GPLv3
+text at `/usr/share/licenses/cloud-cuckoo/LICENSE` and `/app/LICENSE`; the image
+smoke hashes its complete contents against the archived source license. Upstream
+dependency licenses and notices retain their respective terms.
 
 If publication already pushed and pulled the image before its metadata gate
-failed, use **Reconcile existing private Cloud Cuckoo image** on `main` with the
+failed, use **Reconcile existing Cloud Cuckoo image** on `main` with the
 exact native publisher run ID and attempt. Its read-only token admits the accepted
-publisher/source revisions and unexpired native artifacts, verifies fresh private
-metadata, pulls the existing immutable image, and rechecks its ID, nonroot user
-and OCI origin. It writes a new reconciliation receipt without building or
+publisher/source revisions and unexpired native artifacts, verifies fresh package
+metadata, pulls the existing immutable image, and rechecks its ID, nonroot user,
+OCI origin and full source-matched license. It writes a new reconciliation receipt without building or
 pushing an image and preserves the original receipt and its failure state.
 
 Services consumes the resulting immutable `ghcr.io/open-hax/cloud-cuckoo@sha256:…`
-reference and the same merged source SHA. The private package must grant Actions
-read access to `open-hax/services` before a Services workflow can pull it with its
-own ephemeral token; no owner access token belongs in either workflow.
+reference and the same merged source SHA. Public images can be pulled anonymously. While a package remains private,
+Services needs explicit Actions read access and its own ephemeral token. No owner
+access token belongs in either workflow.
 
 Live Colab execution requires a human-approved browser connection and an actual
 runtime. Fixture transport tests, HTTP health, plugin creation, and capability

@@ -34,6 +34,7 @@ def native_context(monkeypatch):
 def image_record(source=SOURCE, image_id=IMAGE_ID):
     return {'Id': image_id, 'Config': {'User': '1000:1000', 'Labels': {
         'org.opencontainers.image.source': 'https://github.com/' + release.REPOSITORY,
+        'org.opencontainers.image.licenses': 'GPL-3.0-or-later',
         'org.opencontainers.image.revision': source}}}
 
 
@@ -106,19 +107,19 @@ def test_test_gate_requires_complete_passing_suite(tmp_path, report):
         release.tests_passed(path)
 
 
-@pytest.mark.parametrize('metadata', [None, {'visibility': 'public', 'repository': {'full_name': release.REPOSITORY}},
+@pytest.mark.parametrize('metadata', [None, {'visibility': 'internal', 'repository': {'full_name': release.REPOSITORY}},
     {'visibility': 'private', 'repository': None}, {'visibility': 'private', 'repository': {'full_name': 'another/repo'}}])
 def test_package_privacy_and_source_are_verified(metadata):
     with pytest.raises(release.Refusal):
-        release.private_package(metadata)
+        release.validate_package(metadata)
     if metadata is not None:
         with pytest.raises(release.Refusal):
-            release.private_package(metadata, permit_missing=True)
-    release.private_package(None, permit_missing=True)  # Absent-or-inaccessible, never a claim of absence.
-    release.private_package(PRIVATE_PACKAGE)
+            release.validate_package(metadata, permit_missing=True)
+    release.validate_package(None, permit_missing=True)  # Absent-or-inaccessible, never a claim of absence.
+    release.validate_package(PRIVATE_PACKAGE)
 
 
-@pytest.mark.parametrize('change', ['revision', 'source', 'user', 'image'])
+@pytest.mark.parametrize('change', ['revision', 'source', 'user', 'image', 'licenses'])
 def test_loaded_image_rejects_label_user_and_identity_drift(change):
     record = image_record()
     if change == 'revision':
@@ -127,6 +128,8 @@ def test_loaded_image_rejects_label_user_and_identity_drift(change):
         record['Config']['Labels']['org.opencontainers.image.source'] = 'https://github.com/another/repo'
     elif change == 'user':
         record['Config']['User'] = 'root'
+    elif change == 'licenses':
+        record['Config']['Labels']['org.opencontainers.image.licenses'] = 'MIT'
     else:
         record['Id'] = 'sha256:' + 'f' * 64
     with pytest.raises(release.Refusal):
@@ -154,6 +157,10 @@ def make_build(tmp_path):
     with tarfile.open(archive, 'w') as tar:
         info = tarfile.TarInfo('Dockerfile')
         content = b'FROM scratch\n'
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+        info = tarfile.TarInfo('LICENSE')
+        content = (Path(__file__).parents[1] / 'LICENSE').read_bytes()
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
     data = {'schema': 'cloud-cuckoo-image/v1', **release.context(), 'source_sha': SOURCE,
@@ -226,7 +233,7 @@ def test_publish_binds_artifact_and_verifies_digest_with_ephemeral_credentials(t
 def test_real_private_rest_shape_without_repository_is_not_an_origin_failure(tmp_path):
     # Actual native GHCR GET returns private metadata without a repository field.
     package = {key: value for key, value in PRIVATE_PACKAGE.items() if key != 'repository'}
-    release.private_package(package)
+    release.validate_package(package)
     _, directory = make_build(tmp_path)
     receipt = publish(tmp_path, directory, Docker(), publication_api(pre=package, post=package))
     data = json.loads(receipt.read_text())
@@ -239,7 +246,7 @@ def test_real_private_rest_shape_without_repository_is_not_an_origin_failure(tmp
                                           ('owner', {'login': 'another-org'})])
 def test_private_package_still_requires_exact_native_identity(key, value):
     with pytest.raises(release.Refusal):
-        release.private_package({**PRIVATE_PACKAGE, key: value})
+        release.validate_package({**PRIVATE_PACKAGE, key: value})
 
 
 @pytest.mark.parametrize('artifact', [
@@ -267,7 +274,7 @@ def test_publish_refuses_public_package_before_registry_login(tmp_path):
     _, directory = make_build(tmp_path)
     docker = Docker()
     with pytest.raises(release.Refusal):
-        publish(tmp_path, directory, docker, publication_api(pre={**PRIVATE_PACKAGE, 'visibility': 'public'}))
+        publish(tmp_path, directory, docker, publication_api(pre={**PRIVATE_PACKAGE, 'visibility': 'internal'}))
     assert not docker.calls
 
 
@@ -331,3 +338,79 @@ def test_probe_cannot_run_outside_main_before_metadata_request(tmp_path, monkeyp
         pytest.fail('Unaccepted context reached package API')
     with pytest.raises(release.Refusal):
         release.probe(tmp_path / 'probe.json', api=forbidden)
+
+
+def test_public_source_repository_is_the_authorized_source():
+    assert release.source_repository(lambda path: {**PRIVATE_REPO, 'private': False}) == 'public'
+    assert release.source_repository(lambda path: PRIVATE_REPO) == 'private'
+    with pytest.raises(release.Refusal):
+        release.source_repository(lambda path: {**PRIVATE_REPO, 'full_name': 'another/repo'})
+
+
+def test_image_contains_complete_source_license_checked_without_network(tmp_path):
+    docker, output = make_build(tmp_path)
+    data = json.loads((output / 'build.json').read_text())
+    expected = release.sha256(Path(__file__).parents[1] / 'LICENSE')
+    assert data['license_verified'] is True and data['license_sha256'] == expected
+    assert data['license_path'] == release.LICENSE_PATH
+    args, kwargs = next((a, k) for a, k in docker.calls if a[1] == 'run' and expected.encode() in k.get('input', b''))
+    assert release.LICENSE_PATH.encode() in kwargs['input']
+    assert args[args.index('--network') + 1] == 'none'
+    assert args[args.index('--user') + 1] == '1000:1000' and '--read-only' in args
+
+
+def test_unverified_license_receipt_cannot_reach_publication(tmp_path):
+    docker, output = make_build(tmp_path)
+    receipt = output / 'build.json'
+    data = json.loads(receipt.read_text())
+    with pytest.raises(release.Refusal):
+        release.license_hash(b'GNU GENERAL PUBLIC LICENSE, truncated')
+    data.pop('license_verified')
+    release.write_json(receipt, data)
+    with pytest.raises(release.Refusal):
+        publish(tmp_path, output, Docker(), publication_api())
+
+
+def test_actual_image_license_smoke_failure_stops_artifact_creation(tmp_path):
+    make_build(tmp_path)
+    class MissingLicense(Docker):
+        def __call__(self, args, **kwargs):
+            if args[1] == 'run' and release.LICENSE_PATH.encode() in kwargs.get('input', b''):
+                raise release.Refusal('Fixture missing complete image license')
+            return super().__call__(args, **kwargs)
+    output = tmp_path / 'rejected-image-artifact'
+    with pytest.raises(release.Refusal):
+        release.build(tmp_path / 'source.tar', tmp_path / 'admit.json', tmp_path / 'tests.xml',
+                      tmp_path / 'second-context', output, command=MissingLicense())
+    assert not output.exists()
+
+
+def test_private_image_is_a_truthful_intermediate_publication_state(tmp_path):
+    _, directory = make_build(tmp_path)
+    data = json.loads(publish(tmp_path, directory, Docker(), publication_api()).read_text())
+    assert data['package_visibility'] == 'private' and data['publication_target'] == 'public'
+    assert data['public_release_complete'] is False and data['anonymous_digest_pull_verified'] is False
+
+
+def test_public_release_requires_a_separate_anonymous_digest_pull(tmp_path):
+    _, directory = make_build(tmp_path)
+    docker = Docker()
+    package = {**PRIVATE_PACKAGE, 'visibility': 'public'}
+    data = json.loads(publish(tmp_path, directory, docker, publication_api(pre=package, post=package)).read_text())
+    assert data['package_visibility'] == 'public' and data['public_release_complete'] is True
+    anonymous = [k['env'] for a, k in docker.calls if a[1] == 'pull' and set(k['env']) == {'PATH', 'HOME', 'DOCKER_CONFIG'}]
+    assert len(anonymous) == 1 and not Path(anonymous[0]['DOCKER_CONFIG']).exists()
+
+
+def test_anonymous_pull_denial_cannot_claim_a_completed_public_release(tmp_path):
+    _, directory = make_build(tmp_path)
+    class DeniedAnonymous(Docker):
+        def __call__(self, args, **kwargs):
+            if args[1] == 'pull' and set(kwargs.get('env', {})) == {'PATH', 'HOME', 'DOCKER_CONFIG'}:
+                raise release.Refusal('Fixture anonymous pull denied')
+            return super().__call__(args, **kwargs)
+    package = {**PRIVATE_PACKAGE, 'visibility': 'public'}
+    with pytest.raises(release.Refusal):
+        publish(tmp_path, directory, DeniedAnonymous(), publication_api(pre=package, post=package))
+    data = json.loads((tmp_path / 'published.json').read_text())
+    assert data['metadata_verified'] is False and data.get('public_release_complete') is not True
