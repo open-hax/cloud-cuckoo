@@ -34,6 +34,22 @@ Dependencies are frozen in `uv.lock`. The upstream's FastMCP 2.14.5 dependency
 is retained. Existing Authlib transitive deprecation warnings are reported by
 the suite; they are not Knoxx compiler warnings.
 
+Build an image from an immutable Git archive, passing that same revision to
+the image metadata:
+
+```sh
+source_revision="$(git rev-parse HEAD)"
+git archive --format=tar "$source_revision" | docker build \
+  --build-arg SOURCE_REVISION="$source_revision" \
+  --tag "cloud-cuckoo:$source_revision" -
+```
+
+The build requires a full lowercase 40-character Git revision. The OCI source
+label names this repository, and the revision label records the supplied
+revision. Labels alone do not attest the build context; the archive above binds
+the context to that revision. Services owns image-digest selection and live
+deployment verification.
+
 Run the local bridge with `COLAB_MCP_TOKEN_FILE=/private/bridge-token
 uv run --frozen knoxx-colab-mcp bridge`. The default HTTP listener is loopback
 port 8023. The installed Stealth service uses its Docker host bridge address
