@@ -135,14 +135,11 @@ def extract(archive, directory):
         source.extractall(directory, filter='data')
 
 
-def admit(source_sha, checkout, archive, test_directory, receipt, *, api=github, command=run):
-    native = context()
-    if not HEX40.fullmatch(source_sha):
+def accepted_merge(source_sha, checkout, *, api, command):
+    if not isinstance(source_sha, str) or not HEX40.fullmatch(source_sha):
         raise Refusal('An explicit full lowercase merged source SHA is required')
-    private_repository(api)
-    print('Private source repository metadata verified', flush=True)
     head = command(['git', '-C', str(checkout), 'rev-parse', 'HEAD']).decode().strip()
-    if head != native['workflow_sha']:
+    if head != context()['workflow_sha']:
         raise Refusal('The builder checkout differs from the native workflow revision')
     command(['git', '-C', str(checkout), 'cat-file', '-e', source_sha + '^{commit}'])
     command(['git', '-C', str(checkout), 'merge-base', '--is-ancestor', source_sha, head])
@@ -153,11 +150,21 @@ def admit(source_sha, checkout, archive, test_directory, receipt, *, api=github,
     if len(matching) != 1 or type(matching[0].get('number')) is not int:
         raise Refusal('Source must be the actual merge commit of one accepted main PR')
     print('Native merged PR evidence verified', flush=True)
+    return matching[0]['number']
+
+
+def admit(source_sha, checkout, archive, test_directory, receipt, *, api=github, command=run):
+    native = context()
+    if not HEX40.fullmatch(source_sha):
+        raise Refusal('An explicit full lowercase merged source SHA is required')
+    private_repository(api)
+    print('Private source repository metadata verified', flush=True)
+    source_pr = accepted_merge(source_sha, checkout, api=api, command=command)
     with Path(archive).open('xb') as stream:
         command(['git', '-C', str(checkout), 'archive', '--format=tar', source_sha], stdout=stream)
     Path(archive).chmod(0o600)
     data = {'schema': 'cloud-cuckoo-image/v1', **native, 'source_sha': source_sha,
-            'source_pr': matching[0]['number'], 'source_archive_sha256': sha256(archive)}
+            'source_pr': source_pr, 'source_archive_sha256': sha256(archive)}
     write_json(receipt, data)
     extract(archive, test_directory)
 
@@ -220,13 +227,15 @@ def build(archive, receipt, report, build_directory, output, *, command=run):
 def private_package(data, *, permit_missing=False):
     # GitHub documents first publication as private. A 404 is retained as
     # absent-or-inaccessible, never asserted to prove absence. Existing visible
-    # packages must already be private and linked to this repository.
+    # packages must have the exact registry identity and private visibility.
+    # GHCR REST has no documented repository-link field; image origin is bound
+    # separately by native run/artifact custody and the pulled OCI image.
     if data is None and permit_missing:
         return
     if (not isinstance(data, dict) or data.get('visibility') != 'private' or
-            not isinstance(data.get('repository'), dict) or
-            data['repository'].get('full_name') != REPOSITORY):
-        raise Refusal('Package privacy and source association are not verified')
+            data.get('name') != 'cloud-cuckoo' or data.get('package_type') != 'container' or
+            not isinstance(data.get('owner'), dict) or data['owner'].get('login') != 'open-hax'):
+        raise Refusal('Package privacy and exact registry identity are not verified')
 
 
 def probe(output, *, api=github):
@@ -311,7 +320,8 @@ def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expec
                 if attempt == 2:
                     raise Refusal('Published package metadata remains unavailable')
                 pause(2)
-            data.update({'package_visibility': 'private', 'metadata_verified': True})
+            data.update({'package_visibility': 'private', 'metadata_verified': True,
+                         'image_provenance_verified': True, 'package_ui_repository_link': 'unknown'})
             write_json(output, data)
             emit('image_reference', reference)
         finally:
@@ -319,6 +329,110 @@ def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expec
                 command(['docker', 'logout', 'ghcr.io'], env=docker_env, timeout=30)
             except Refusal:
                 pass  # The containing auth directory is removed unconditionally.
+
+
+def artifact_proof(data, artifact_id, digest, run_id, workflow_sha, name):
+    if (type(artifact_id) is not int or artifact_id < 1 or not isinstance(digest, str) or
+            not isinstance(data, dict) or data.get('id') != artifact_id or data.get('name') != name or
+            data.get('expired') is not False or data.get('digest') != digest or
+            not re.fullmatch(r'sha256:[0-9a-f]{64}', digest) or
+            data.get('workflow_run', {}).get('id') != run_id or
+            data.get('workflow_run', {}).get('head_sha') != workflow_sha):
+        raise Refusal('Native publisher artifact custody is unavailable')
+
+
+def reconcile_admit(publisher_run_id, publisher_run_attempt, checkout, receipt, *, api=github, command=run):
+    native = context()
+    private_repository(api)
+    if (not publisher_run_id.isdecimal() or not publisher_run_attempt.isdecimal() or
+            min(int(publisher_run_id), int(publisher_run_attempt)) < 1):
+        raise Refusal('An exact native publisher run and attempt are required')
+    run_id, attempt = int(publisher_run_id), int(publisher_run_attempt)
+    publisher = api(f'repos/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}')
+    if (publisher.get('id') != run_id or publisher.get('run_attempt') != attempt or
+            publisher.get('event') != 'workflow_dispatch' or publisher.get('head_branch') != 'main' or
+            publisher.get('path') != '.github/workflows/publish-image.yml' or publisher.get('status') != 'completed' or
+            publisher.get('conclusion') not in ['success', 'failure'] or
+            publisher.get('repository', {}).get('full_name') != REPOSITORY or
+            publisher.get('head_repository', {}).get('full_name') != REPOSITORY):
+        raise Refusal('The native source publisher run is not eligible')
+    workflow_sha = publisher.get('head_sha')
+    accepted_merge(workflow_sha, checkout, api=api, command=command)
+    listed = api(f'repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100')
+    artifacts = listed.get('artifacts', [])
+    name = f'cloud-cuckoo-release-{run_id}-{attempt}'
+    matching = [a for a in artifacts if a.get('name') == name]
+    if listed.get('total_count') != len(artifacts) or len(matching) != 1:
+        raise Refusal('Native release artifact enumeration is incomplete or ambiguous')
+    selected = matching[0]
+    artifact_proof(selected, selected.get('id'), selected.get('digest', ''), run_id, workflow_sha, name)
+    data = {'schema': 'cloud-cuckoo-reconciliation-input/v1', **native,
+            'publisher_run_id': run_id, 'publisher_run_attempt': attempt, 'publisher_workflow_sha': workflow_sha,
+            'release_artifact_id': selected['id'], 'release_artifact_digest': selected['digest']}
+    write_json(receipt, data)
+    emit('artifact_id', selected['id'])
+
+
+def reconcile(directory, admission, checkout, output, *, api=github, command=run):
+    native = context()
+    proof = json.loads(Path(admission).read_text())
+    if (proof.get('schema') != 'cloud-cuckoo-reconciliation-input/v1' or
+            any(proof.get(key) != value for key, value in native.items())):
+        raise Refusal('The current reconciliation identity changed')
+    # Recollect publisher custody now; the downloaded artifact cannot choose it.
+    with tempfile.TemporaryDirectory(prefix='cloud-cuckoo-proof-') as temporary:
+        refreshed = Path(temporary) / 'admission.json'
+        reconcile_admit(str(proof['publisher_run_id']), str(proof['publisher_run_attempt']), checkout,
+                        refreshed, api=api, command=command)
+        if json.loads(refreshed.read_text()) != proof:
+            raise Refusal('Native release artifact custody changed')
+    data = json.loads((Path(directory) / 'release-receipt.json').read_text())
+    if (data.get('schema') != 'cloud-cuckoo-image/v1' or data.get('repository') != REPOSITORY or
+            data.get('run_id') != proof['publisher_run_id'] or data.get('run_attempt') != proof['publisher_run_attempt'] or
+            data.get('workflow_sha') != proof['publisher_workflow_sha'] or data.get('pending_smoke') != 'passed' or
+            not re.fullmatch(r'sha256:[0-9a-f]{64}', data.get('image_id', '')) or
+            not re.fullmatch(r'sha256:[0-9a-f]{64}', data.get('image_digest', '')) or
+            data.get('image_reference') != IMAGE + '@' + data.get('image_digest', '') or
+            data.get('image_tag') != image_tag(data) or
+            not HEX64.fullmatch(data.get('source_archive_sha256', '')) or
+            not HEX64.fullmatch(data.get('docker_archive_sha256', ''))):
+        raise Refusal('The published image receipt is not source-bound')
+    counts = data.get('tests', {})
+    if (set(counts) != {'tests', 'failures', 'errors', 'skipped'} or
+            any(type(value) is not int for value in counts.values()) or counts['tests'] < 22 or
+            any(counts[key] != 0 for key in ['failures', 'errors', 'skipped'])):
+        raise Refusal('The native source suite did not completely pass')
+    if data.get('source_pr') != accepted_merge(data.get('source_sha'), checkout, api=api, command=command):
+        raise Refusal('The image receipt differs from its accepted source PR')
+    artifact_id, digest = data.get('build_artifact_id'), data.get('build_artifact_digest', '')
+    if type(artifact_id) is not int or artifact_id < 1:
+        raise Refusal('Native build artifact identity is unavailable')
+    artifact_proof(api(f'repos/{REPOSITORY}/actions/artifacts/{artifact_id}'), artifact_id, digest,
+                   data['run_id'], data['workflow_sha'], f"cloud-cuckoo-build-{data['run_id']}-{data['run_attempt']}")
+    private_package(api('orgs/open-hax/packages/container/cloud-cuckoo'))
+    token, actor = os.environ.get('GH_TOKEN'), os.environ.get('GITHUB_ACTOR')
+    if not token or not actor:
+        raise Refusal('The ephemeral read-only registry identity is unavailable')
+    with tempfile.TemporaryDirectory(prefix='cloud-cuckoo-pull-') as auth:
+        docker_env = {key: value for key, value in os.environ.items() if key not in {'GH_TOKEN', 'GITHUB_TOKEN'}}
+        docker_env['DOCKER_CONFIG'] = auth
+        try:
+            command(['docker', 'login', 'ghcr.io', '--username', actor, '--password-stdin'], input=token.encode(), env=docker_env, timeout=60)
+            command(['docker', 'pull', data['image_reference']], env=docker_env)
+            validate_image(image_record(data['image_reference'], lambda args: command(args, env=docker_env)),
+                           data['source_sha'], data['image_id'])
+            private_package(api('orgs/open-hax/packages/container/cloud-cuckoo'))
+        finally:
+            try:
+                command(['docker', 'logout', 'ghcr.io'], env=docker_env, timeout=30)
+            except Refusal:
+                pass
+    data.update({'metadata_verified': True, 'image_provenance_verified': True, 'package_visibility': 'private',
+                 'package_ui_repository_link': 'unknown', 'reconciled_at': datetime.now(timezone.utc).isoformat(),
+                 'reconciliation': {**native, 'release_artifact_id': proof['release_artifact_id'],
+                                    'release_artifact_digest': proof['release_artifact_digest']}})
+    write_json(output, data)
+    emit('image_reference', data['image_reference'])
 
 
 def main():
@@ -335,8 +449,14 @@ def main():
         publish_args.add_argument('--' + name, required=True)
     probe_args = sub.add_parser('probe')
     probe_args.add_argument('--output', required=True)
+    reconcile_admit_args = sub.add_parser('reconcile-admit')
+    for name in ['publisher-run-id', 'publisher-run-attempt', 'checkout', 'receipt']:
+        reconcile_admit_args.add_argument('--' + name, required=True)
+    reconcile_args = sub.add_parser('reconcile')
+    for name in ['directory', 'admission', 'checkout', 'output']:
+        reconcile_args.add_argument('--' + name, required=True)
     args = vars(parser.parse_args())
-    mode = args.pop('mode')
+    mode = args.pop('mode').replace('-', '_')
     try:
         globals()[mode](**args)
         print('Cloud Cuckoo image step completed: ' + mode)
