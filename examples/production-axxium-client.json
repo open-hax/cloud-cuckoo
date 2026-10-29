@@ -1,0 +1,7 @@
+{
+  "id": "knoxx-colab",
+  "secret": "UNSET",
+  "redirect-uris": ["https://knoxx.promethean.rest/colab/auth/callback"],
+  "refresh-enabled?": true,
+  "device-enabled?": false
+}
