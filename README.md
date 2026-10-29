@@ -139,7 +139,7 @@ HTTP 503 for grant routes, HTTP 401 for MCP calls, and `identity_available: fals
 
 An isolated publication job uses only the repository's ephemeral `GITHUB_TOKEN`
 to push `ghcr.io/open-hax/cloud-cuckoo` under a source/run/attempt tag. Visible
-existing packages must be private and associated with this repository. GitHub
+existing packages must match the exact owner/name/type and remain private. GitHub
 creates a first package privately; the workflow verifies actual package metadata
 after publication and refuses to claim successful privacy verification when it
 cannot read that metadata. It records the immutable image digest, OCI source and
@@ -147,6 +147,21 @@ revision, test/image checks, native workflow identity, and build artifact digest
 in the `cloud-cuckoo-release-<run>-<attempt>` artifact. A failed post-publication
 metadata check can leave a pushed image with an explicitly unverified receipt.
 This workflow does not deploy or access host, human, or Google credentials.
+
+Image provenance comes from the native owning-repository run and artifact,
+accepted source SHA, and actual pulled digest/image ID/OCI labels. GitHub's GHCR
+REST metadata omits a documented repository-link field, and GHCR is unsupported
+by the Packages GraphQL API. The package's UI repository link is therefore
+recorded as `unknown`; it is not substituted for image provenance. Package
+visibility must still be verified as `private` from native metadata.
+
+If publication already pushed and pulled the image before its metadata gate
+failed, use **Reconcile existing private Cloud Cuckoo image** on `main` with the
+exact native publisher run ID and attempt. Its read-only token admits the accepted
+publisher/source revisions and unexpired native artifacts, verifies fresh private
+metadata, pulls the existing immutable image, and rechecks its ID, nonroot user
+and OCI origin. It writes a new reconciliation receipt without building or
+pushing an image and preserves the original receipt and its failure state.
 
 Services consumes the resulting immutable `ghcr.io/open-hax/cloud-cuckoo@sha256:…`
 reference and the same merged source SHA. The private package must grant Actions

@@ -1,0 +1,81 @@
+name: Reconcile existing private Cloud Cuckoo image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publisher_run_id:
+        description: Native owning-repository image publication run ID
+        required: true
+        type: string
+      publisher_run_attempt:
+        description: Exact native publication attempt
+        required: true
+        type: string
+        default: '1'
+
+permissions: {}
+
+jobs:
+  reconcile:
+    if: github.repository == 'open-hax/cloud-cuckoo' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: controller
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.9.5'
+      - name: Test current admission and publication boundaries without credentials
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/test-home"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
+            UV_CACHE_DIR="$RUNNER_TEMP/uv-cache" TMPDIR="$RUNNER_TEMP" \
+            uv run --project "$GITHUB_WORKSPACE/controller" --python 3.13 --frozen --extra test \
+            python -m pytest -q "$GITHUB_WORKSPACE/controller/tests/test_release_image.py" \
+            "$GITHUB_WORKSPACE/controller/tests/test_reconcile_image.py"
+      - name: Admit exact native publisher run and release artifact
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
+          PUBLISHER_RUN_ATTEMPT: ${{ inputs.publisher_run_attempt }}
+        run: |
+          python3 controller/scripts/release_image.py reconcile-admit \
+            --publisher-run-id "$PUBLISHER_RUN_ID" --publisher-run-attempt "$PUBLISHER_RUN_ATTEMPT" \
+            --checkout "$GITHUB_WORKSPACE/controller" --receipt "$RUNNER_TEMP/admission.json"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          repository: open-hax/cloud-cuckoo
+          run-id: ${{ inputs.publisher_run_id }}
+          artifact-ids: ${{ steps.admit.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/publisher-release
+      - name: Verify fresh private metadata and pulled immutable image without publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 controller/scripts/release_image.py reconcile \
+            --directory "$RUNNER_TEMP/publisher-release" --admission "$RUNNER_TEMP/admission.json" \
+            --checkout "$GITHUB_WORKSPACE/controller" --output "$RUNNER_TEMP/reconciled-release.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cloud-cuckoo-reconciled-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/reconciled-release.json
+          if-no-files-found: warn
+          retention-days: 30

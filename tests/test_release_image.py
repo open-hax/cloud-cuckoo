@@ -16,7 +16,8 @@ WORKFLOW = 'b' * 40
 IMAGE_ID = 'sha256:' + 'c' * 64
 ARTIFACT_DIGEST = 'd' * 64
 REGISTRY_DIGEST = 'sha256:' + 'e' * 64
-PRIVATE_PACKAGE = {'visibility': 'private', 'repository': {'full_name': release.REPOSITORY}}
+PRIVATE_PACKAGE = {'visibility': 'private', 'name': 'cloud-cuckoo', 'package_type': 'container',
+                   'owner': {'login': 'open-hax'}, 'repository': {'full_name': release.REPOSITORY}}
 PRIVATE_REPO = {'full_name': release.REPOSITORY, 'private': True, 'default_branch': 'main'}
 
 
@@ -210,6 +211,7 @@ def test_publish_binds_artifact_and_verifies_digest_with_ephemeral_credentials(t
     data = json.loads(receipt.read_text())
     assert data['image_reference'] == release.IMAGE + '@' + REGISTRY_DIGEST
     assert data['package_visibility'] == 'private' and data['metadata_verified'] is True
+    assert data['image_provenance_verified'] is True and data['package_ui_repository_link'] == 'unknown'
     login = next((args, kwargs) for args, kwargs in docker.calls if args[1] == 'login')
     assert login[1]['input'] == b'fixture-ephemeral-secret'
     for args, kwargs in docker.calls:
@@ -219,6 +221,25 @@ def test_publish_binds_artifact_and_verifies_digest_with_ephemeral_credentials(t
             assert not Path(kwargs['env']['DOCKER_CONFIG']).exists()
     assert any(args == ['docker', 'pull', release.IMAGE + '@' + REGISTRY_DIGEST] for args, _ in docker.calls)
     assert any(args[1] == 'logout' for args, _ in docker.calls)
+
+
+def test_real_private_rest_shape_without_repository_is_not_an_origin_failure(tmp_path):
+    # Actual native GHCR GET returns private metadata without a repository field.
+    package = {key: value for key, value in PRIVATE_PACKAGE.items() if key != 'repository'}
+    release.private_package(package)
+    _, directory = make_build(tmp_path)
+    receipt = publish(tmp_path, directory, Docker(), publication_api(pre=package, post=package))
+    data = json.loads(receipt.read_text())
+    assert data['metadata_verified'] is True and data['package_visibility'] == 'private'
+    assert data['image_provenance_verified'] is True
+    assert data['package_ui_repository_link'] == 'unknown'
+
+
+@pytest.mark.parametrize(('key', 'value'), [('name', 'another-image'), ('package_type', 'npm'),
+                                          ('owner', {'login': 'another-org'})])
+def test_private_package_still_requires_exact_native_identity(key, value):
+    with pytest.raises(release.Refusal):
+        release.private_package({**PRIVATE_PACKAGE, key: value})
 
 
 @pytest.mark.parametrize('artifact', [
