@@ -1,4 +1,4 @@
-name: Reconcile existing private Cloud Cuckoo image
+name: Reconcile existing Cloud Cuckoo image
 
 on:
   workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
           path: ${{ runner.temp }}/publisher-release
-      - name: Verify fresh private metadata and pulled immutable image without publication
+      - name: Verify fresh package metadata and full license in the immutable image
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

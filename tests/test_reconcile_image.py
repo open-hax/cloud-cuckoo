@@ -92,6 +92,7 @@ class Commands:
         self.unrelated = None
         self.image = {'Id': IMAGE_ID, 'Config': {'User': '1000:1000', 'Labels': {
             'org.opencontainers.image.source': 'https://github.com/' + release.REPOSITORY,
+            'org.opencontainers.image.licenses': 'GPL-3.0-or-later',
             'org.opencontainers.image.revision': SOURCE}}}
 
     def __call__(self, args, **kwargs):
@@ -101,10 +102,12 @@ class Commands:
                 return (self.head + '\n').encode()
             if 'merge-base' in args and self.unrelated in args[args.index('--is-ancestor') + 1:]:
                 raise release.Refusal('Fixture source is not accepted ancestry')
+            if 'show' in args:
+                return (Path(__file__).parents[1] / 'LICENSE').read_bytes()
             assert 'cat-file' in args or 'merge-base' in args
             return b''
         assert args[0] == 'docker'
-        assert args[1] in {'login', 'pull', 'image', 'logout'}, 'Reconciliation invoked a publication or host effect'
+        assert args[1] in {'login', 'pull', 'image', 'logout', 'run'}, 'Reconciliation invoked a publication or host effect'
         if args[1:3] == ['image', 'inspect']:
             return json.dumps([self.image]).encode()
         return b''
@@ -228,7 +231,7 @@ def test_only_complete_source_suite_supplies_test_evidence(tmp_path, key, value)
     with pytest.raises(release.Refusal):reconcile(tmp_path, mutate=lambda d:d['tests'].update({key: value}))
 
 
-@pytest.mark.parametrize(('key', 'value'), [('visibility', 'public'), ('name', 'other'),
+@pytest.mark.parametrize(('key', 'value'), [('visibility', 'internal'), ('name', 'other'),
     ('package_type', 'npm'), ('owner', {'login': 'another-owner'})])
 def test_supported_package_identity_is_required_before_pull(tmp_path, key, value):
     native, commands = Native(), Commands();native.package[key] = value
@@ -237,10 +240,24 @@ def test_supported_package_identity_is_required_before_pull(tmp_path, key, value
 
 
 def test_postpull_visibility_drift_refuses_and_cleans_up_auth(tmp_path):
-    native, commands = Native(), Commands();native.package_after = {**PRIVATE_PACKAGE, 'visibility': 'public'}
+    native, commands = Native(), Commands();native.package_after = {**PRIVATE_PACKAGE, 'visibility': 'internal'}
     with pytest.raises(release.Refusal):reconcile(tmp_path, native=native, commands=commands)
     assert not (tmp_path / 'reconciled.json').exists()
     assert any(args[:2] == ['docker', 'logout'] for args, _ in commands.calls)
+
+
+def test_public_reconcile_checks_license_and_anonymous_access(tmp_path):
+    native, commands = Native(), Commands()
+    native.repository['private'] = False
+    native.package['visibility'] = 'public'
+    data, _, _ = reconcile(tmp_path, native=native, commands=commands)
+    assert data['publication_target'] == 'public' and data['public_release_complete'] is True
+    assert data['license_verified'] is True
+    assert data['license_sha256'] == release.sha256(Path(__file__).parents[1] / 'LICENSE')
+    assert any(args[:2] == ['docker', 'run'] and release.LICENSE_PATH.encode() in options.get('input', b'')
+               for args, options in commands.calls)
+    assert any(args[:2] == ['docker', 'pull'] and set(options['env']) == {'PATH', 'HOME', 'DOCKER_CONFIG'}
+               for args, options in commands.calls)
 
 
 @pytest.mark.parametrize('change', ['id', 'user', 'revision', 'source'])

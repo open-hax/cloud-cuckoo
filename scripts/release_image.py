@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and publish a private source-bound image; never deploy a host."""
+"""Build a GPL source-bound image for public distribution; never deploy a host."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -19,6 +19,7 @@ REPOSITORY = 'open-hax/cloud-cuckoo'
 IMAGE = 'ghcr.io/' + REPOSITORY
 HEX40 = re.compile(r'[0-9a-f]{40}\Z')
 HEX64 = re.compile(r'[0-9a-f]{64}\Z')
+LICENSE_PATH = '/usr/share/licenses/cloud-cuckoo/LICENSE'
 
 SMOKE = r'''
 import asyncio
@@ -101,7 +102,7 @@ def context():
     if (os.environ.get('GITHUB_REPOSITORY') != REPOSITORY or
             os.environ.get('GITHUB_REF') != 'refs/heads/main' or
             os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'):
-        raise Refusal('Only a manual main-branch run of the private source repository is supported')
+        raise Refusal('Only a manual main-branch run of the canonical source repository is supported')
     workflow_sha = os.environ.get('GITHUB_SHA', '')
     run_id = os.environ.get('GITHUB_RUN_ID', '')
     attempt = os.environ.get('GITHUB_RUN_ATTEMPT', '')
@@ -111,11 +112,12 @@ def context():
             'run_id': int(run_id), 'run_attempt': int(attempt)}
 
 
-def private_repository(api):
+def source_repository(api):
     data = api('repos/' + REPOSITORY)
-    if (data.get('full_name') != REPOSITORY or data.get('private') is not True or
+    if (data.get('full_name') != REPOSITORY or type(data.get('private')) is not bool or
             data.get('default_branch') != 'main'):
-        raise Refusal('The source repository must remain private with main as its default')
+        raise Refusal('The canonical source repository must use main as its default')
+    return 'private' if data['private'] else 'public'
 
 
 def write_json(path, value):
@@ -157,14 +159,15 @@ def admit(source_sha, checkout, archive, test_directory, receipt, *, api=github,
     native = context()
     if not HEX40.fullmatch(source_sha):
         raise Refusal('An explicit full lowercase merged source SHA is required')
-    private_repository(api)
-    print('Private source repository metadata verified', flush=True)
+    repository_visibility = source_repository(api)
+    print('Canonical source repository metadata verified', flush=True)
     source_pr = accepted_merge(source_sha, checkout, api=api, command=command)
     with Path(archive).open('xb') as stream:
         command(['git', '-C', str(checkout), 'archive', '--format=tar', source_sha], stdout=stream)
     Path(archive).chmod(0o600)
     data = {'schema': 'cloud-cuckoo-image/v1', **native, 'source_sha': source_sha,
-            'source_pr': source_pr, 'source_archive_sha256': sha256(archive)}
+            'source_pr': source_pr, 'source_archive_sha256': sha256(archive),
+            'source_repository_visibility': repository_visibility}
     write_json(receipt, data)
     extract(archive, test_directory)
 
@@ -192,6 +195,7 @@ def validate_image(record, source_sha, expected_id=None):
     if (not re.fullmatch(r'sha256:[0-9a-f]{64}', image_id) or
             (expected_id is not None and image_id != expected_id) or config.get('User') != '1000:1000' or
             labels.get('org.opencontainers.image.source') != 'https://github.com/' + REPOSITORY or
+            labels.get('org.opencontainers.image.licenses') != 'GPL-3.0-or-later' or
             labels.get('org.opencontainers.image.revision') != source_sha):
         raise Refusal('The image does not match the selected source and nonroot contract')
     return image_id
@@ -199,6 +203,41 @@ def validate_image(record, source_sha, expected_id=None):
 
 def image_tag(data):
     return f"{IMAGE}:source-{data['source_sha']}-run-{data['run_id']}-attempt-{data['run_attempt']}"
+
+
+def license_hash(content):
+    if (len(content) < 30000 or b'GNU GENERAL PUBLIC LICENSE' not in content or
+            b'Version 3, 29 June 2007' not in content or b'END OF TERMS AND CONDITIONS' not in content):
+        raise Refusal('The full source GPLv3 license is unavailable')
+    return hashlib.sha256(content).hexdigest()
+
+
+def verify_license(image_id, expected, command, *, env=None):
+    if not isinstance(expected, str) or not HEX64.fullmatch(expected):
+        raise Refusal('The source license digest is unavailable')
+    check = ("from pathlib import Path; import hashlib; "
+             f"assert hashlib.sha256(Path({LICENSE_PATH!r}).read_bytes()).hexdigest()=={expected!r}; "
+             "print('Full source license verified')")
+    command(['docker', 'run', '--rm', '-i', '--pull', 'never', '--network', 'none', '--read-only',
+             '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+             '--pids-limit', '64', '--memory', '128m', image_id, 'python', '-'],
+            input=check.encode(), env=env, timeout=60)
+
+
+def public_pull(reference, source_sha, image_id, command):
+    with tempfile.TemporaryDirectory(prefix='cloud-cuckoo-anonymous-') as auth:
+        # Empty auth plus a minimal environment: no inherited registry identity.
+        environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': auth, 'DOCKER_CONFIG': auth}
+        command(['docker', 'pull', reference], env=environment)
+        validate_image(image_record(reference, lambda args: command(args, env=environment)), source_sha, image_id)
+
+
+def visibility_record(visibility, reference, source_sha, image_id, command):
+    anonymous = visibility == 'public'
+    if anonymous:
+        public_pull(reference, source_sha, image_id, command)
+    return {'package_visibility': visibility, 'publication_target': 'public',
+            'anonymous_digest_pull_verified': anonymous, 'public_release_complete': anonymous}
 
 
 def build(archive, receipt, report, build_directory, output, *, command=run):
@@ -210,38 +249,43 @@ def build(archive, receipt, report, build_directory, output, *, command=run):
     tag = image_tag(data)
     command(['docker', 'build', '--build-arg', 'SOURCE_REVISION=' + data['source_sha'], '--tag', tag, str(build_directory)])
     image_id = validate_image(image_record(tag, command), data['source_sha'])
+    source_license = license_hash((Path(build_directory) / 'LICENSE').read_bytes())
     command(['docker', 'run', '--rm', '-i', '--pull', 'never', '--network', 'none', '--read-only',
              '--user', '1000:1000', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
              '--pids-limit', '64', '--memory', '512m', '--tmpfs', '/tmp:rw,noexec,nosuid,size=32m',
              image_id, 'python', '-'], input=SMOKE.encode(), timeout=180)
+    verify_license(image_id, source_license, command)
     Path(output).mkdir(parents=True, exist_ok=False)
     image_archive = Path(output) / 'image.tar'
     command(['docker', 'save', '--output', str(image_archive), tag])
     data.update({'image_id': image_id, 'image_tag': tag, 'docker_archive_sha256': sha256(image_archive),
-                 'tests': counts, 'pending_smoke': 'passed'})
+                 'tests': counts, 'pending_smoke': 'passed', 'license_sha256': source_license,
+                 'license_path': LICENSE_PATH, 'license_verified': True})
     write_json(Path(output) / 'build.json', data)
     emit('image_id', image_id)
     emit('docker_archive_sha256', data['docker_archive_sha256'])
 
 
-def private_package(data, *, permit_missing=False):
+def validate_package(data, *, permit_missing=False):
     # GitHub documents first publication as private. A 404 is retained as
     # absent-or-inaccessible, never asserted to prove absence. Existing visible
-    # packages must have the exact registry identity and private visibility.
+    # packages must have the exact identity. Public is the authorized target;
+    # private is a recorded transitional state while org policy blocks it.
     # GHCR REST has no documented repository-link field; image origin is bound
     # separately by native run/artifact custody and the pulled OCI image.
     if data is None and permit_missing:
         return
-    if (not isinstance(data, dict) or data.get('visibility') != 'private' or
+    if (not isinstance(data, dict) or data.get('visibility') not in ['private', 'public'] or
             data.get('name') != 'cloud-cuckoo' or data.get('package_type') != 'container' or
             not isinstance(data.get('owner'), dict) or data['owner'].get('login') != 'open-hax'):
-        raise Refusal('Package privacy and exact registry identity are not verified')
+        raise Refusal('Package visibility and exact registry identity are not verified')
+    return data['visibility']
 
 
 def probe(output, *, api=github):
     """Observe native package metadata without building, pushing or qualifying it."""
     native = context()
-    private_repository(api)
+    source_repository(api)
     observations = []
     for version in ['2022-11-28', '2026-03-10']:
         try:
@@ -270,7 +314,7 @@ def probe(output, *, api=github):
 def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expected_image_id, output,
             *, api=github, command=run, pause=time.sleep):
     native = context()
-    private_repository(api)
+    repository_visibility = source_repository(api)
     if not artifact_id.isdecimal() or not HEX64.fullmatch(artifact_digest):
         raise Refusal('The native build artifact identity is invalid')
     artifact = api(f'repos/{REPOSITORY}/actions/artifacts/{artifact_id}')
@@ -283,10 +327,12 @@ def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expec
             any(data.get(key) != value for key, value in native.items()) or
             not HEX40.fullmatch(data.get('source_sha', '')) or data.get('pending_smoke') != 'passed' or
             data.get('image_id') != expected_image_id or data.get('docker_archive_sha256') != expected_archive_sha or
+            data.get('license_verified') is not True or data.get('license_path') != LICENSE_PATH or
+            not HEX64.fullmatch(data.get('license_sha256', '')) or
             data.get('image_tag') != image_tag(data) or
             sha256(Path(directory) / 'image.tar') != expected_archive_sha):
         raise Refusal('The build artifact content or source receipt changed')
-    private_package(api('orgs/open-hax/packages/container/cloud-cuckoo', missing=True), permit_missing=True)
+    validate_package(api('orgs/open-hax/packages/container/cloud-cuckoo', missing=True), permit_missing=True)
     command(['docker', 'load', '--input', str(Path(directory) / 'image.tar')])
     validate_image(image_record(expected_image_id, command), data['source_sha'], expected_image_id)
     tag = image_tag(data)
@@ -315,12 +361,13 @@ def publish(directory, artifact_id, artifact_digest, expected_archive_sha, expec
             for attempt in range(3):
                 package = api('orgs/open-hax/packages/container/cloud-cuckoo', missing=True)
                 if package is not None:
-                    private_package(package)
+                    observed_visibility = validate_package(package)
                     break
                 if attempt == 2:
                     raise Refusal('Published package metadata remains unavailable')
                 pause(2)
-            data.update({'package_visibility': 'private', 'metadata_verified': True,
+            data.update(visibility_record(observed_visibility, reference, data['source_sha'], expected_image_id, command))
+            data.update({'metadata_verified': True, 'source_repository_visibility': repository_visibility,
                          'image_provenance_verified': True, 'package_ui_repository_link': 'unknown'})
             write_json(output, data)
             emit('image_reference', reference)
@@ -343,7 +390,7 @@ def artifact_proof(data, artifact_id, digest, run_id, workflow_sha, name):
 
 def reconcile_admit(publisher_run_id, publisher_run_attempt, checkout, receipt, *, api=github, command=run):
     native = context()
-    private_repository(api)
+    source_repository(api)
     if (not publisher_run_id.isdecimal() or not publisher_run_attempt.isdecimal() or
             min(int(publisher_run_id), int(publisher_run_attempt)) < 1):
         raise Refusal('An exact native publisher run and attempt are required')
@@ -409,7 +456,7 @@ def reconcile(directory, admission, checkout, output, *, api=github, command=run
         raise Refusal('Native build artifact identity is unavailable')
     artifact_proof(api(f'repos/{REPOSITORY}/actions/artifacts/{artifact_id}'), artifact_id, digest,
                    data['run_id'], data['workflow_sha'], f"cloud-cuckoo-build-{data['run_id']}-{data['run_attempt']}")
-    private_package(api('orgs/open-hax/packages/container/cloud-cuckoo'))
+    validate_package(api('orgs/open-hax/packages/container/cloud-cuckoo'))
     token, actor = os.environ.get('GH_TOKEN'), os.environ.get('GITHUB_ACTOR')
     if not token or not actor:
         raise Refusal('The ephemeral read-only registry identity is unavailable')
@@ -421,13 +468,17 @@ def reconcile(directory, admission, checkout, output, *, api=github, command=run
             command(['docker', 'pull', data['image_reference']], env=docker_env)
             validate_image(image_record(data['image_reference'], lambda args: command(args, env=docker_env)),
                            data['source_sha'], data['image_id'])
-            private_package(api('orgs/open-hax/packages/container/cloud-cuckoo'))
+            source_license = license_hash(command(['git', '-C', str(checkout), 'show', data['source_sha'] + ':LICENSE']))
+            verify_license(data['image_id'], source_license, command, env=docker_env)
+            observed_visibility = validate_package(api('orgs/open-hax/packages/container/cloud-cuckoo'))
         finally:
             try:
                 command(['docker', 'logout', 'ghcr.io'], env=docker_env, timeout=30)
             except Refusal:
                 pass
-    data.update({'metadata_verified': True, 'image_provenance_verified': True, 'package_visibility': 'private',
+    data.update(visibility_record(observed_visibility, data['image_reference'], data['source_sha'], data['image_id'], command))
+    data.update({'metadata_verified': True, 'image_provenance_verified': True, 'license_verified': True,
+                 'license_sha256': source_license, 'license_path': LICENSE_PATH,
                  'package_ui_repository_link': 'unknown', 'reconciled_at': datetime.now(timezone.utc).isoformat(),
                  'reconciliation': {**native, 'release_artifact_id': proof['release_artifact_id'],
                                     'release_artifact_digest': proof['release_artifact_digest']}})

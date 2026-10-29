@@ -8,7 +8,8 @@ LABEL org.opencontainers.image.source="https://github.com/open-hax/cloud-cuckoo"
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
       org.opencontainers.image.version="0.4.0"
 WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY LICENSE /usr/share/licenses/cloud-cuckoo/LICENSE
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 ENV PATH="/app/.venv/bin:$PATH" HOME=/tmp PYTHONDONTWRITEBYTECODE=1
