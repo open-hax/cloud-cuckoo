@@ -20,19 +20,53 @@ application imports or reuse of tests cached without assertion-pass rewriting.
 Official pytest hooks measure successful assertion executions separately during
 setup/call/teardown and capture collection failures, warnings and report phases.
 The public logging record factory is chained without changing the returned
-record. Warning-level and higher records deny evidence even when pytest captures
-them or a logger has only a `NullHandler`. Nonempty captured stderr also denies
+record. Warning-level and higher records require an exact admitted test contract
+or deny evidence, even when pytest captures them or a logger has only a
+`NullHandler`. Nonempty captured stderr also denies
 evidence, including output consumed through the public `CaptureFixture.readouterr`
 method. Public `logging.makeLogRecord` reconstruction is observed after its
 dictionary is applied; its initial `level=None` factory call remains valid.
-The observer hashes primitive unformatted origin/format fields and never calls
-`getMessage`, `str` or `repr` on lazy message arguments. Only hashes and categories enter the structured projection; diagnostic
-payloads are not copied there. The parent creates an exclusive warning journal
+The passive observer hashes primitive unformatted origin/format fields and never
+formats lazy message arguments. Only an explicit test-side exact contract renders
+its presented record. The structured projection retains hashes, categories and
+custody metadata; diagnostic payloads are not copied there. The parent creates an exclusive warning journal
 and hashes it after the child process exits. This includes records emitted by
 `logging.shutdown` after the final exclusive summary writer. Each journal row
 binds the fresh execution nonce, and the journal shares the output size limit.
 Missing, changed, malformed or stale journals and incomplete summaries deny
 evidence.
+
+`expected_diagnostics.py` supports deliberate negative application contracts.
+Standard pytest `caplog` retains records; named logger trees route into that
+capture without changing logger levels or filters. The helper requires the exact
+logger name, numeric level, rendered message, exception type and message, complete
+cause/context graph and exception-group children. Its mismatch raises a runtime
+contract error, which supplies no mutation kill. Generic tool or ASGI format
+strings cannot excuse an unknown exception at the same logging call site.
+
+Each observed warning/error has a unique record identity bound to the fresh
+parent nonce. Only the source-bound helper can acknowledge that original live
+record, after the full contract passes, during the current test call. The
+observer freezes primitive record fields and exception arguments/chain identities
+before capture; replacing a record's message, format arguments, exception tuple or exception
+arguments cannot turn an unknown event into an expected one. Opaque format or exception
+arguments remain unacknowledgeable without formatting them in the observer.
+The acknowledgement binds a literal `expect` call in that declared test file, the
+observation and contract hashes, rendered-message hash and exception-graph hash.
+The parent verifies the sealed observation/acknowledgement journal against the
+summary and admitted source. `diagnostics` retains every observed record;
+`expected_diagnostics` separately retains the exact acknowledged observations and
+their test sites. This is admitted harness evidence, not authenticated inspector
+identity or a sandbox against malicious accepted test code.
+
+Missing/extra events, unknown exceptions, incorrect messages/chains, acknowledgements
+from another test or phase, nonce/record replay, late shutdown records, Python
+warnings and all unconsumed stderr still deny a baseline or assertion kill.
+There are no severity changes, warning filters, wildcard exemptions or omitted
+application cases. The application tests explicitly assert development-cookie,
+one-use-code, fixture tool-error and injected crash diagnostics while retaining
+their original HTTP/OAuth/MCP/revocation assertions. Earlier refused baselines
+remain refused; fresh accepted source and native custody are still required.
 Only call-phase `AssertionError` at a declared test `assert`, missing expected
 exceptions at a declared `pytest.raises`, or explicit declared `pytest.fail`
 can be an assertion-failure candidate. Runtime exceptions, application-internal

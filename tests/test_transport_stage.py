@@ -72,7 +72,7 @@ def test_fixture_listeners_refuse_other_interfaces_ports_and_profiles(role, port
             server.validate_transport_fixture_binding(profile, role, host, candidate)
 
 
-async def test_real_gateway_forwards_to_dedicated_mcp_fixtures_and_preserves_errors():
+async def test_real_gateway_forwards_to_dedicated_mcp_fixtures_and_preserves_errors(diagnostics):
     async with serve(make_fixture_server('bridge', TOKEN)) as bridge:
         async with serve(make_fixture_server('compute', TOKEN)) as compute:
             backend = server.TransportStagingGateway(TOKEN)
@@ -99,12 +99,24 @@ async def test_real_gateway_forwards_to_dedicated_mcp_fixtures_and_preserves_err
                     assert output.structured_content['synthetic_upstreams'] is True
                     error = await client.call_tool('colab_call', {'name': 'fixture_failure', 'arguments': {}}, raise_on_error=False)
                     assert error.is_error
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'",
+                        exception=ValueError('Synthetic fixture accepts only the discovered read-only echo tool'))
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'",
+                        exception=ValueError("Error calling tool 'colab_call': Synthetic fixture accepts only the discovered read-only echo tool"))
                     usage = (await client.call_tool('colab_compute_usage', {})).data
                     assert usage['synthetic_upstreams'] is True and usage['compute_units'] is None
                     sessions = (await client.call_tool('colab_compute_sessions', {})).data
                     assert sessions['sessions'] == [] and sessions['synthetic_upstreams'] is True
                     refused = await client.call_tool('colab_compute_start', {'code': "raise RuntimeError('never execute')"}, raise_on_error=False)
                     assert refused.is_error
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_compute_start'",
+                        exception=ValueError('Synthetic transport stage cannot execute code or allocate a runtime'))
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_compute_start'",
+                        exception=ValueError("Error calling tool 'colab_compute_start': Synthetic transport stage cannot execute code or allocate a runtime"))
 
 
 async def test_fixture_backends_never_execute_code_or_allocate_jobs():
@@ -145,7 +157,7 @@ def test_transport_profile_cannot_launch_a_google_browser(monkeypatch, mode):
         server.main()
 
 
-async def test_oauth_authenticates_real_stage_forwarding_and_denies_replay_and_revocation(tmp_path, monkeypatch):
+async def test_oauth_authenticates_real_stage_forwarding_and_denies_replay_and_revocation(tmp_path, monkeypatch, diagnostics):
     profile = TRANSPORT_STAGING
     actor = 'actor_00000000-0000-4000-8000-000000000001'
     callback = 'http://127.0.0.1:18776/callback'
@@ -164,6 +176,8 @@ async def test_oauth_authenticates_real_stage_forwarding_and_denies_replay_and_r
         return real_http(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=discovery)))
     monkeypatch.setattr(httpx, 'Client', fixture_discovery)
     auth = make_gateway_auth(profile.base_url, tmp_path / 'oauth', config, profile)
+    diagnostics.expect(logger='fastmcp.server.auth.oauth_proxy', level=30,
+        message='Using non-secure cookies for development; deploy with HTTPS for production.')
     active = True
     async def introspection(request):
         return httpx.Response(200, json={'active': active, 'sub': actor, 'client_id': profile.client_id,

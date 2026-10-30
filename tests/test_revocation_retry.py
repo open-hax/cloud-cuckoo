@@ -20,7 +20,7 @@ from test_transport import serve, GATEWAY_TOKEN
 
 
 @pytest.mark.parametrize("failure_index", [0, 1, "crash", "before-marker"])
-async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatch, failure_index):
+async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatch, failure_index, diagnostics):
     path = tmp_path / "client.json"
     path.write_text(json.dumps({"issuer": oauth.AXXIUM_ISSUER, "client_id": CONFIG.client_id,
                                 "client_secret": SECRET, "allowed_subjects": [ACTOR]}))
@@ -95,6 +95,11 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
                     m.setattr(auth._client_storage, "put", crash_after_family)
                 response = await http.post(base + "/revoke", data={"client_id": client, "token": tokens["access_token"]})
             assert response.status_code == (500 if isinstance(failure_index, str) else 503)
+            if isinstance(failure_index, str):
+                diagnostic = RuntimeError('fixture crash before family marker' if failure_index == 'before-marker'
+                                          else 'fixture crash after durable family marker')
+                diagnostics.expect(logger='uvicorn.error', level=40,
+                    message='Exception in ASGI application\n', exception=diagnostic)
             expected_calls = 0 if isinstance(failure_index, str) else failure_index + 1
             assert upstream_requests == ["upstream-refresh-a", "upstream-access-a"][:expected_calls]
             if isinstance(failure_index, str):
@@ -178,7 +183,7 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
             assert await restored.load_access_token(other["access_token"])
 
 
-async def test_concurrent_authorization_code_exchange_is_one_use(tmp_path, monkeypatch):
+async def test_concurrent_authorization_code_exchange_is_one_use(tmp_path, monkeypatch, diagnostics):
     path = tmp_path / "client.json"
     path.write_text(json.dumps({"issuer": oauth.AXXIUM_ISSUER, "client_id": CONFIG.client_id,
                                 "client_secret": SECRET, "allowed_subjects": [ACTOR]}))
@@ -219,3 +224,5 @@ async def test_concurrent_authorization_code_exchange_is_one_use(tmp_path, monke
             first, second = await asyncio.gather(http.post(base + "/token", data=fields),
                                                  http.post(base + "/token", data=fields))
             assert sorted([first.status_code, second.status_code]) == [200, 400]
+            diagnostics.expect(logger='fastmcp.server.auth.oauth_proxy', level=40,
+                message='Authorization code not found in client codes: concurrent-code')
