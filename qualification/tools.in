@@ -1,0 +1,4 @@
+# Native mutation operators and measured pytest execution. No custom operators.
+cosmic-ray==8.7.0
+pytest==9.1.1
+pytest-asyncio==1.3.0
