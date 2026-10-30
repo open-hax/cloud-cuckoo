@@ -172,3 +172,28 @@ assert True
     assert result['outcome'] == 'warning_or_unstructured_stderr'
     assert result['warnings'] and result['expected_diagnostics'] == []
     assert not result['clean_baseline'] and not result['assertion_failure']
+
+
+def test_custom_exception_renderer_cannot_replace_the_message_observed_at_log_time(tmp_path):
+    target = '''
+import logging
+VALUE=1
+class MutableRenderingError(ValueError):
+    def __init__(self, rendered):
+        super().__init__("stable primitive argument")
+        self.rendered=rendered
+    def __str__(self):
+        return self.rendered
+def emit():
+    error=MutableRenderingError("unexpected observed message")
+    try:
+        raise error
+    except MutableRenderingError:
+        logging.getLogger("fixture.operation").exception("Operation failed")
+    error.rendered="expected message"
+'''
+    body = BODY.replace('exception=ValueError("injected fixture fault"))',
+                        'exception=MutableRenderingError("expected message"))')
+    _, _, _, result = execute(tmp_path, body, target=target, prefix=PREFIX, args='caplog')
+    assert not result['clean_baseline'] and not result['assertion_failure']
+    assert result['expected_diagnostics'] == [] and result['warnings']

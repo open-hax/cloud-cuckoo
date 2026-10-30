@@ -51,6 +51,11 @@ observer freezes primitive record fields and exception arguments/chain identitie
 before capture; replacing a record's message, format arguments, exception tuple or exception
 arguments cannot turn an unknown event into an expected one. Opaque format or exception
 arguments remain unacknowledgeable without formatting them in the observer.
+Supported exception rendering is deliberately bounded: the native default
+`BaseException` renderer, native exception groups, and `OSError` with frozen
+primitive errno/message/filename slots. Custom `__str__` implementations are
+opaque even if their args are primitive; mutable Python rendering state cannot
+be asserted from an args snapshot. Opaque events remain unexpected diagnostics.
 The acknowledgement binds a literal `expect` call in that declared test file, the
 observation and contract hashes, rendered-message hash and exception-graph hash.
 The parent verifies the sealed observation/acknowledgement journal against the

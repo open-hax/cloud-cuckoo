@@ -20,24 +20,38 @@ def exception_snapshot(error, seen=None):
         return None
     if not isinstance(error, BaseException):
         return {'opaque': True}
+    renderer = inspect.getattr_static(type(error), '__str__')
+    native_state = {}
+    if isinstance(error, BaseExceptionGroup):
+        if type(error) not in (BaseExceptionGroup, ExceptionGroup) or renderer is not BaseExceptionGroup.__str__:
+            return {'opaque': True}
+    elif renderer is OSError.__str__:
+        native_state = {name: getattr(OSError, name).__get__(error)
+                        for name in ('errno', 'strerror', 'filename', 'filename2')}
+        if not all(type(value) in (str, int, float, bool, type(None)) for value in native_state.values()):
+            return {'opaque': True}
+    elif renderer is not BaseException.__str__:
+        # A custom __str__ may read mutable state outside primitive args.
+        # It cannot be frozen safely without running arbitrary rendering code.
+        return {'opaque': True}
     seen = {} if seen is None else seen
     if id(error) in seen:
         return {'reference': seen[id(error)]}
     seen[id(error)] = len(seen)
-    arguments = BaseException.__getattribute__(error, 'args')
+    arguments = BaseException.args.__get__(error)
     children = []
     if isinstance(error, BaseExceptionGroup):
-        arguments = (BaseException.__getattribute__(error, 'message'),)
+        arguments = (BaseExceptionGroup.message.__get__(error),)
         children = [exception_snapshot(child, seen)
-                    for child in BaseException.__getattribute__(error, 'exceptions')]
+                    for child in BaseExceptionGroup.exceptions.__get__(error)]
     if not all(type(value) in (str, int, float, bool, type(None)) for value in arguments):
         return {'opaque': True}
     return {'index': seen[id(error)], 'type': type(error).__module__ + '.' + type(error).__qualname__,
         'arguments': list(arguments),
-        'suppress_context': BaseException.__getattribute__(error, '__suppress_context__'),
-        'cause': exception_snapshot(BaseException.__getattribute__(error, '__cause__'), seen),
-        'context': exception_snapshot(BaseException.__getattribute__(error, '__context__'), seen),
-        'children': children}
+        'suppress_context': BaseException.__suppress_context__.__get__(error),
+        'cause': exception_snapshot(BaseException.__cause__.__get__(error), seen),
+        'context': exception_snapshot(BaseException.__context__.__get__(error), seen),
+        'children': children, 'native_state': native_state}
 
 
 def snapshot_is_exact(value):
@@ -57,10 +71,10 @@ def exception_chain(error, seen=None):
         return {'reference': seen[id(error)]}
     seen[id(error)] = len(seen)
     return {'index': seen[id(error)], 'type': type(error).__module__ + '.' + type(error).__qualname__,
-            'message': str(error), 'suppress_context': error.__suppress_context__,
-            'cause': exception_chain(error.__cause__, seen),
-            'context': exception_chain(error.__context__, seen),
-            'children': [exception_chain(child, seen) for child in error.exceptions]
+            'message': str(error), 'suppress_context': BaseException.__suppress_context__.__get__(error),
+            'cause': exception_chain(BaseException.__cause__.__get__(error), seen),
+            'context': exception_chain(BaseException.__context__.__get__(error), seen),
+            'children': [exception_chain(child, seen) for child in BaseExceptionGroup.exceptions.__get__(error)]
                         if isinstance(error, BaseExceptionGroup) else []}
 
 
