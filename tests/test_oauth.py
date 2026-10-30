@@ -328,7 +328,7 @@ def test_closed_staging_profile_rejects_production_confusion(tmp_path):
     assert backend.status()["execution_verified"] is False
 
 
-async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatch):
+async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatch, diagnostics):
     from knoxx_colab_mcp.oauth import STAGING, PRODUCTION
     from knoxx_colab_mcp.server import gateway_backend
     path = tmp_path / "client.json"
@@ -355,6 +355,8 @@ async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatc
     with monkeypatch.context() as m:
         m.setattr(oauth, "httpx", SimpleNamespace(Client=DiscoveryHTTP))
         auth = make_gateway_auth(STAGING.base_url, tmp_path / "state", path, STAGING)
+    diagnostics.expect(logger='fastmcp.server.auth.oauth_proxy', level=30,
+        message='Using non-secure cookies for development; deploy with HTTPS for production.')
     transaction = {"resource": STAGING.base_url + "/mcp", "scopes": SCOPES,
                    "proxy_code_verifier": "verifier"}
     upstream = auth._build_upstream_authorize_url("fixture-state", transaction)
@@ -410,4 +412,7 @@ async def test_staging_oauth_mcp_and_environment_boundaries(tmp_path, monkeypatc
                 connection = (await mcp.call_tool("colab_connect", {})).data
                 assert "cannot connect" in connection["instructions"] and "command" not in connection
                 assert (await mcp.call_tool("colab_call", {"name": "x", "arguments": {}}, raise_on_error=False)).is_error
+                diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                    message="Error calling tool 'colab_call'",
+                    exception=ValueError('Staging identity probe cannot execute Colab operations'))
     assert (tmp_path / "state" / "staging" / "axxium-proxy").is_dir()

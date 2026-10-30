@@ -18,7 +18,7 @@ import subprocess
 import time
 import tempfile
 
-from pytest_evidence import encoded, producer_hashes, relative_file, sha, source_hashes, valid_test_site
+from pytest_evidence import encoded, producer_hashes, relative_file, sha, source_hashes, valid_test_site, valid_diagnostic_site
 
 
 class EvidenceError(ValueError):
@@ -173,6 +173,7 @@ def assess(output, manifest, expected_execution_sha256):
     result = {'schema': 'cloud-pytest-assessment/v1', 'source_sha': manifest.get('source_sha'),
               'phase': manifest.get('phase'),
               'outcome': 'evidence_error', 'call_assertions': 0, 'warnings': [],
+              'diagnostics': [], 'expected_diagnostics': [],
               'assertion_failure': False, 'clean_baseline': False, 'qualification_credit': False}
     try:
         execution = output / 'execution.json'
@@ -187,14 +188,24 @@ def assess(output, manifest, expected_execution_sha256):
         journal = output / 'log-records.jsonl'
         require(file_sha(journal) == envelope['log_records_sha256']
                 and journal.stat().st_size <= 16 * 1024 * 1024)
-        logged = [json.loads(line) for line in journal.read_bytes().splitlines()]
-        require(all(isinstance(row, dict)
-                and set(row) == {'schema', 'nonce', 'category', 'message_sha256', 'when', 'nodeid'}
-                and row['schema'] == 'cloud-pytest-log-record/v1' and row['nonce'] == envelope['nonce']
+        events = [json.loads(line) for line in journal.read_bytes().splitlines()]
+        require(all(isinstance(row, dict) and set(row) == {'schema', 'nonce', 'event', 'payload'}
+                and row['schema'] == 'cloud-pytest-log-event/v2' and row['nonce'] == envelope['nonce']
+                and row['event'] in {'observed', 'acknowledged'} and isinstance(row['payload'], dict)
+                for row in events))
+        logged = [row['payload'] for row in events if row['event'] == 'observed']
+        acknowledgements = [row['payload'] for row in events if row['event'] == 'acknowledged']
+        require(all(set(row) == {'record_id', 'category', 'message_sha256', 'when', 'nodeid'}
+                and isinstance(row['record_id'], str) and re.fullmatch('[0-9a-f]{32}', row['record_id'])
                 and isinstance(row['category'], str) and (row['category'].startswith('logging.')
-                    or row['category'] == 'pytest.CaptureFixtureStderr')
+                    or row['category'] in {'pytest.CaptureFixtureStderr', 'pytest.CapturedStderr'})
                 and isinstance(row['message_sha256'], str) and re.fullmatch('[0-9a-f]{64}', row['message_sha256'])
-                and row['when'] == 'process' and row['nodeid'] is None for row in logged))
+                and row['when'] in {'setup', 'call', 'teardown', 'collection', 'process'}
+                and (row['nodeid'] is None or row['nodeid'] in manifest['expected_nodeids']
+                     or (row['when'] == 'collection'
+                         and row['nodeid'] in {test.split('::', 1)[0] for test in manifest['tests']})) for row in logged))
+        by_id = {row['record_id']: row for row in logged}
+        require(len(by_id) == len(logged))
         if not envelope['custody_before'] or not envelope['custody_after']:
             result['outcome'] = 'custody_error'
             return result
@@ -219,8 +230,41 @@ def assess(output, manifest, expected_execution_sha256):
                 type(facts['exit_code']) is int and type(facts['collection_failed']) is bool and
                 isinstance(facts['collection_errors'], list))
         result['call_assertions'] = facts['assertion_passes']['call']
-        result['warnings'] = facts['warnings'] + [
-            {key: value for key, value in row.items() if key not in {'schema', 'nonce'}} for row in logged]
+        require(isinstance(facts.get('expected_diagnostics'), list)
+                and encoded(facts['expected_diagnostics']) == encoded(acknowledgements))
+        accepted = set()
+        for acknowledgement in acknowledgements:
+            require(set(acknowledgement) == {'record_id', 'observation_sha256', 'contract_sha256',
+                'rendered_message_sha256', 'exception_chain_sha256', 'nodeid', 'when', 'test_site'})
+            record_id = acknowledgement['record_id']
+            require(isinstance(record_id, str) and record_id in by_id and record_id not in accepted)
+            observation = by_id[record_id]
+            require(observation['category'].startswith('logging.') and observation['when'] == 'call'
+                    and acknowledgement['when'] == 'call' and observation['nodeid'] == acknowledgement['nodeid']
+                    and acknowledgement['nodeid'] in manifest['expected_nodeids']
+                    and isinstance(acknowledgement['test_site'], list) and len(acknowledgement['test_site']) == 2
+                    and acknowledgement['test_site'][0] == acknowledgement['nodeid'].split('::', 1)[0]
+                    and all(isinstance(acknowledgement[field], str)
+                            and re.fullmatch('[0-9a-f]{64}', acknowledgement[field])
+                            for field in ('observation_sha256', 'contract_sha256', 'rendered_message_sha256', 'exception_chain_sha256'))
+                    and acknowledgement['observation_sha256'] == sha(encoded(observation))
+                    and valid_diagnostic_site(manifest, acknowledgement['test_site']))
+            accepted.add(record_id)
+            result['expected_diagnostics'].append({'observation': observation, 'acknowledgement': acknowledgement})
+        # The full diagnostic projection survives acknowledgement. Facts and
+        # the sealed late journal must agree on each repeated record identity.
+        diagnostics = []
+        seen = set()
+        for observation in facts['warnings'] + logged:
+            record_id = observation.get('record_id')
+            if record_id is not None:
+                require(record_id in by_id and encoded(observation) == encoded(by_id[record_id]))
+                if record_id in seen:
+                    continue
+                seen.add(record_id)
+            diagnostics.append(observation)
+        result['diagnostics'] = diagnostics
+        result['warnings'] = [row for row in diagnostics if row.get('record_id') not in accepted]
         if result['warnings'] or (output / 'stderr.bin').stat().st_size:
             result['outcome'] = 'warning_or_unstructured_stderr'
             return result
