@@ -4,6 +4,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -414,3 +416,33 @@ def test_anonymous_pull_denial_cannot_claim_a_completed_public_release(tmp_path)
         publish(tmp_path, directory, DeniedAnonymous(), publication_api(pre=package, post=package))
     data = json.loads((tmp_path / 'published.json').read_text())
     assert data['metadata_verified'] is False and data.get('public_release_complete') is not True
+
+
+@pytest.mark.parametrize(('step_name', 'project_name'), [
+    ('Test the current controller publication boundaries without credentials', 'controller'),
+    ('Test archived source without publishing or host credentials', 'source-tests'),
+])
+def test_publisher_project_context_imports_ordinary_test_support(tmp_path, step_name, project_name):
+    """Exercise the real conftest from the working directory selected by CI."""
+    import yaml
+    root = Path(__file__).parents[1]
+    workflow = yaml.safe_load((root / '.github/workflows/publish-image.yml').read_text())
+    step = next(item for item in workflow['jobs']['build']['steps'] if item.get('name') == step_name)
+    workspace, temporary = tmp_path / 'workspace', tmp_path / 'runner-temp'
+    workspace.mkdir()
+    temporary.mkdir()
+    project = workspace / project_name if project_name == 'controller' else temporary / project_name
+    (project / 'tests').mkdir(parents=True)
+    (project / 'qualification').mkdir()
+    (project / 'pytest.ini').write_text('[pytest]\n')
+    for name in ('tests/conftest.py', 'qualification/expected_diagnostics.py'):
+        (project / name).write_bytes((root / name).read_bytes())
+    target = project / 'tests/test_case.py'
+    target.write_text('def test_project_context():\n    assert True\n')
+    selected = Path(step.get('working-directory', '.').replace('${{ runner.temp }}', str(temporary)))
+    if not selected.is_absolute(): selected = workspace / selected
+    environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(temporary),
+        'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1'}
+    result = subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(target)],
+        cwd=selected, env=environment, capture_output=True, timeout=20, check=False)
+    assert result.returncode == 0, (result.stdout.decode(), result.stderr.decode())
