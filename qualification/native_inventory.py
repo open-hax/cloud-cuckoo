@@ -186,7 +186,7 @@ def freeze(root, source_sha, tool_lock, output):
                    'HOME': str(output / 'home'), 'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1'}
     for operation, args in [('init', [str(output/'cosmic-ray.toml'), str(output/'session.sqlite')]),
                             ('dump', [str(output/'session.sqlite')])]:
-        process = subprocess.run([sys.executable, '-B', '-m', 'cosmic_ray.cli', operation, *args],
+        process = subprocess.run([sys.executable, '-I', '-B', '-m', 'cosmic_ray.cli', operation, *args],
             cwd=root, env=environment, capture_output=True, timeout=180, check=False)
         write_new(output / (operation + '.stdout'), process.stdout)
         write_new(output / (operation + '.stderr'), process.stderr)

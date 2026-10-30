@@ -123,3 +123,21 @@ def test_output_parent_alias_and_dot_dot_refuse_before_native_commands_or_writes
         assert not destination.exists()
         assert not (root/inventory.MODULE/'injected').exists()
     assert inventory.source_custody(root, revision) == before
+
+
+def test_untracked_checkout_package_cannot_replace_native_cli_or_site_customization(tmp_path):
+    """Native -I commands import installed tools independently of their cwd."""
+    root, revision, _, lock = setup_source(tmp_path)
+    shadow = root/'cosmic_ray'
+    shadow.mkdir()
+    marker = root/'CHECKOUT_PACKAGE_EXECUTED'
+    payload = 'from pathlib import Path\nPath('+repr(str(marker))+').write_text("shadow executed")\n'
+    (shadow/'__init__.py').write_text(payload)
+    (shadow/'cli.py').write_text(payload)
+    (root/'sitecustomize.py').write_text(payload)
+    before = inventory.source_custody(root, revision)
+    result = inventory.freeze(root, revision, lock, tmp_path/'native-inventory')
+    assert result['proposal_count'] > 0
+    assert result['evaluated_mutants'] == 0
+    assert not marker.exists()
+    assert inventory.source_custody(root, revision) == before

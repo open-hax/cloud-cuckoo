@@ -4,6 +4,8 @@
 provider. It invokes native `init` and `dump`, requires an empty results table,
 and uses the official `mutate_code` and `get_operator` APIs. No test command,
 mutation campaign, kill collection or production admission runs in this slice.
+Native CLI subprocesses use Python isolated mode so untracked checkout packages
+and checkout-local `sitecustomize` cannot replace the installed native tool.
 
 The complete tracked application checkout must equal its immutable Git source.
 The full `src/knoxx_colab_mcp` scope, native session and dump, all proposal
@@ -22,7 +24,7 @@ Install `qualification/tools.lock` in a separate Python 3.13 environment with
 `uv pip install --require-hashes`. Native controls run with `-c /dev/null`
 because they test independent synthetic tool fixtures, without application
 pytest configuration. Native CI retains the actual source, hash lock, raw
-streams, JUnit report and synthetic fixture inputs. These six controls include
+streams, JUnit report and synthetic fixture inputs. These seven controls include
 real native session creation and mutation materialization; they supply zero
 application test executions or qualification credit.
 
