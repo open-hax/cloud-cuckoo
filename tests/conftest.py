@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Standard log capture for application contracts; logger levels stay intact."""
+import sys
+
 import pytest
 
-from qualification.expected_diagnostics import capture_expected_logs
+if 'pytest_evidence' in sys.modules:
+    # Measurement executes the separately admitted producer helper. Collection
+    # and ordinary pytest can use this checkout's identical test-support module.
+    from expected_diagnostics import capture_expected_logs
+else:
+    from qualification.expected_diagnostics import capture_expected_logs
 
 
 APPLICATION_MODULES = frozenset({'test_compute.py', 'test_oauth.py', 'test_transport.py',
