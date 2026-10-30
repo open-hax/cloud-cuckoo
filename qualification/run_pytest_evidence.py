@@ -90,6 +90,7 @@ def _stop(process):
 
 
 def run_evidence(manifest, output, *, timeout=90, output_limit=16 * 1024 * 1024):
+    """Seal parent-observed streams and diagnostics after the child exits."""
     output = Path(output)
     require(timeout > 0 and output_limit > 0)
     output.mkdir(mode=0o700)
@@ -102,7 +103,7 @@ def run_evidence(manifest, output, *, timeout=90, output_limit=16 * 1024 * 1024)
                 'nonce': nonce, 'observed_exit': None, 'timed_out': False, 'output_limit': False,
                 'custody_before': False, 'custody_after': False, 'summary_sha256': None}
     envelope['pycache_prefix'] = str(cache.resolve())
-    for name in ('stdout.bin', 'stderr.bin'):
+    for name in ('stdout.bin', 'stderr.bin', 'log-records.jsonl'):
         _write(output / name, b'')
     process = None
     try:
@@ -114,6 +115,7 @@ def run_evidence(manifest, output, *, timeout=90, output_limit=16 * 1024 * 1024)
         env = clean_env(output, {'PYTHONPATH': os.pathsep.join([str(Path(__file__).resolve().parent), *package_paths]),
             'CLOUD_PYTEST_MANIFEST': str((output / 'manifest.json').resolve()),
             'CLOUD_PYTEST_CACHE': str(cache.resolve()),
+            'CLOUD_PYTEST_LOG_JOURNAL': str((output / 'log-records.jsonl').resolve()),
             'CLOUD_PYTEST_SUMMARY': str((output / 'summary.json').resolve()), 'CLOUD_PYTEST_NONCE': nonce})
         args = [manifest['python'], '-B', '-X', 'pycache_prefix=' + str(cache.resolve()), '-P', '-m', 'pytest',
                 '-q', '-p', 'pytest_evidence', '-p', 'pytest_asyncio.plugin',
@@ -128,13 +130,13 @@ def run_evidence(manifest, output, *, timeout=90, output_limit=16 * 1024 * 1024)
                     envelope['timed_out'] = True
                     _stop(process)
                     break
-                if sum((output / name).stat().st_size for name in ('stdout.bin', 'stderr.bin')) > output_limit:
+                if sum((output / name).stat().st_size for name in ('stdout.bin', 'stderr.bin', 'log-records.jsonl')) > output_limit:
                     envelope['output_limit'] = True
                     _stop(process)
                     break
                 time.sleep(0.025)
             envelope['observed_exit'] = process.wait(timeout=10)
-            if sum((output / name).stat().st_size for name in ('stdout.bin', 'stderr.bin')) > output_limit:
+            if sum((output / name).stat().st_size for name in ('stdout.bin', 'stderr.bin', 'log-records.jsonl')) > output_limit:
                 envelope['output_limit'] = True
         custody(manifest)
         require(target_runtime(manifest['python'], output) == manifest['runtime_identity'])
@@ -159,6 +161,7 @@ def run_evidence(manifest, output, *, timeout=90, output_limit=16 * 1024 * 1024)
         envelope['summary_sha256'] = sha(summary.read_bytes())
     envelope['stdout_sha256'] = file_sha(output / 'stdout.bin')
     envelope['stderr_sha256'] = file_sha(output / 'stderr.bin')
+    envelope['log_records_sha256'] = file_sha(output / 'log-records.jsonl')
     digest = _write(output / 'execution.json', encoded(envelope))
     result = assess(output, manifest, digest)
     return {**result, 'execution_sha256': digest}
@@ -181,6 +184,17 @@ def assess(output, manifest, expected_execution_sha256):
         for name in ('stdout', 'stderr'):
             path = output / (name + '.bin')
             require(file_sha(path) == envelope[name + '_sha256'])
+        journal = output / 'log-records.jsonl'
+        require(file_sha(journal) == envelope['log_records_sha256']
+                and journal.stat().st_size <= 16 * 1024 * 1024)
+        logged = [json.loads(line) for line in journal.read_bytes().splitlines()]
+        require(all(isinstance(row, dict)
+                and set(row) == {'schema', 'nonce', 'category', 'message_sha256', 'when', 'nodeid'}
+                and row['schema'] == 'cloud-pytest-log-record/v1' and row['nonce'] == envelope['nonce']
+                and isinstance(row['category'], str) and (row['category'].startswith('logging.')
+                    or row['category'] == 'pytest.CaptureFixtureStderr')
+                and isinstance(row['message_sha256'], str) and re.fullmatch('[0-9a-f]{64}', row['message_sha256'])
+                and row['when'] == 'process' and row['nodeid'] is None for row in logged))
         if not envelope['custody_before'] or not envelope['custody_after']:
             result['outcome'] = 'custody_error'
             return result
@@ -204,8 +218,10 @@ def assess(output, manifest, expected_execution_sha256):
                 isinstance(facts['warnings'], list) and isinstance(facts['collected'], list) and
                 type(facts['exit_code']) is int and type(facts['collection_failed']) is bool and
                 isinstance(facts['collection_errors'], list))
-        result['call_assertions'], result['warnings'] = facts['assertion_passes']['call'], facts['warnings']
-        if facts['warnings'] or (output / 'stderr.bin').stat().st_size:
+        result['call_assertions'] = facts['assertion_passes']['call']
+        result['warnings'] = facts['warnings'] + [
+            {key: value for key, value in row.items() if key not in {'schema', 'nonce'}} for row in logged]
+        if result['warnings'] or (output / 'stderr.bin').stat().st_size:
             result['outcome'] = 'warning_or_unstructured_stderr'
             return result
         if sorted(facts['collected']) != manifest['expected_nodeids'] or facts['collection_failed']:

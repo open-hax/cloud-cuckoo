@@ -6,9 +6,12 @@ in its own process. The parent seals observed execution and an outer native CI
 collector must authenticate that producer artifact before qualification.
 """
 import ast
+import atexit
+import functools
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -120,8 +123,10 @@ def pytest_collection_finish(session):
 
 
 def pytest_collectreport(report):
+    """Keep collection errors and diagnostics separate from test assertions."""
     if report.failed and _STATE is not None:
         _STATE['collection_errors'].append(report.nodeid)
+    _captured_stderr(report, 'collection')
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -148,8 +153,10 @@ def pytest_assertion_pass(item, lineno, orig, expl):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
+    """Observe each real pytest phase without replacing its result."""
     outcome = yield
     report = outcome.get_result()
+    _captured_stderr(report, report.when)
     record = {'nodeid': item.nodeid, 'when': report.when, 'outcome': report.outcome,
               'exception_type': None, 'failure_kind': None, 'test_site': None}
     if call.excinfo is not None:
@@ -180,13 +187,105 @@ def pytest_warning_recorded(warning_message, when, nodeid, location):
 
 
 _WARNINGS = []
+_LOG_WARNINGS = []
 _STATE = None
+
+
+def _captured_stderr(report, phase):
+    """Record unconsumed report diagnostics without copying their payload."""
+    value = getattr(report, 'capstderr', '')
+    if value:
+        _LOG_WARNINGS.append({'category': 'pytest.CapturedStderr',
+            'message_sha256': sha(value.encode()), 'when': phase, 'nodeid': report.nodeid})
+
+
+_RECORD_FACTORY = logging.getLogRecordFactory()
+_MAKE_LOG_RECORD = logging.makeLogRecord
+_CAPTURE_READ = pytest.CaptureFixture.readouterr
+
+
+def _journal_diagnostic(observation):
+    """Append metadata to the exclusive file the parent seals after exit."""
+    _LOG_WARNINGS.append(observation)
+    journal = os.environ.get('CLOUD_PYTEST_LOG_JOURNAL')
+    if journal:
+        raw = encoded({'schema': 'cloud-pytest-log-record/v1',
+            'nonce': os.environ['CLOUD_PYTEST_NONCE'], **observation}) + b'\n'
+        descriptor = os.open(journal, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        try:
+            with os.fdopen(descriptor, 'ab', closefd=False) as target:
+                target.write(raw)
+        finally:
+            os.close(descriptor)
+
+
+def _observe_warning(record):
+    """Hash primitive unformatted fields without invoking lazy arguments."""
+    level = record.levelno
+    # makeLogRecord first asks the factory for an uninitialized level=None
+    # record. Its public wrapper observes the final reconstructed record.
+    if type(level) in (int, float) and level >= logging.WARNING:
+        fields = {name: value if type(value) in (str, int, float, bool, type(None)) else None
+                  for name in ('name', 'pathname', 'lineno', 'levelno', 'msg')
+                  for value in (getattr(record, name, None),)}
+        category = 'WARNING' if level < logging.ERROR else 'ERROR' if level < logging.CRITICAL else 'CRITICAL'
+        _journal_diagnostic({'category': 'logging.' + category,
+            'message_sha256': sha(encoded(fields)), 'when': 'process', 'nodeid': None})
+
+
+@functools.wraps(_RECORD_FACTORY)
+def _observe_log_record(*args, **kwargs):
+    """Forward the original factory call and return the identical record."""
+    record = _RECORD_FACTORY(*args, **kwargs)
+    _observe_warning(record)
+    return record
+
+
+@functools.wraps(_MAKE_LOG_RECORD)
+def _observe_make_log_record(*args, **kwargs):
+    """Observe the completed standard-library reconstruction, once updated."""
+    record = _MAKE_LOG_RECORD(*args, **kwargs)
+    _observe_warning(record)
+    return record
+
+
+@functools.wraps(_CAPTURE_READ)
+def _observe_capture_read(*args, **kwargs):
+    """Retain diagnostics before a public capture read consumes its buffer."""
+    result = _CAPTURE_READ(*args, **kwargs)
+    if result.err:
+        raw = result.err if isinstance(result.err, bytes) else result.err.encode()
+        _journal_diagnostic({'category': 'pytest.CaptureFixtureStderr',
+            'message_sha256': sha(raw), 'when': 'process', 'nodeid': None})
+    return result
+
+
+logging.setLogRecordFactory(_observe_log_record)
+logging.makeLogRecord = _observe_make_log_record
+pytest.CaptureFixture.readouterr = _observe_capture_read
+
+
+def _write_final_summary():
+    """Write complete pytest facts; the parent separately seals late records."""
+    if _STATE is None:
+        return
+    # Registered before tests: their later atexit callbacks run before this
+    # final writer, so even a warning sent to NullHandler after pytest exits
+    # is observed. os._exit or an incomplete session still earns no credit.
+    _STATE['warnings'] = _WARNINGS + _LOG_WARNINGS
+    path = Path(os.environ['CLOUD_PYTEST_SUMMARY'])
+    with path.open('x') as target:
+        os.chmod(path, 0o600)
+        target.write(json.dumps(_STATE, sort_keys=True) + '\n')
+
+
+atexit.register(_write_final_summary)
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
+    """Freeze phase facts and source custody before interpreter shutdown."""
     state = session.config._evidence
-    state['warnings'] = _WARNINGS
     state['source_after'] = source_hashes(state['manifest'])
     state['exit_code'] = int(exitstatus)
     state['collection_failed'] = bool(state['collection_errors'])
@@ -207,7 +306,3 @@ def pytest_sessionfinish(session, exitstatus):
     # No exception text, assert operands, bearer token or protocol payload is
     # copied into this structured projection. Full raw streams stay private.
     del state['manifest']
-    path = Path(os.environ['CLOUD_PYTEST_SUMMARY'])
-    with path.open('x') as target:
-        os.chmod(path, 0o600)
-        target.write(json.dumps(state, sort_keys=True) + '\n')

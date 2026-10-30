@@ -19,6 +19,20 @@ application imports or reuse of tests cached without assertion-pass rewriting.
 
 Official pytest hooks measure successful assertion executions separately during
 setup/call/teardown and capture collection failures, warnings and report phases.
+The public logging record factory is chained without changing the returned
+record. Warning-level and higher records deny evidence even when pytest captures
+them or a logger has only a `NullHandler`. Nonempty captured stderr also denies
+evidence, including output consumed through the public `CaptureFixture.readouterr`
+method. Public `logging.makeLogRecord` reconstruction is observed after its
+dictionary is applied; its initial `level=None` factory call remains valid.
+The observer hashes primitive unformatted origin/format fields and never calls
+`getMessage`, `str` or `repr` on lazy message arguments. Only hashes and categories enter the structured projection; diagnostic
+payloads are not copied there. The parent creates an exclusive warning journal
+and hashes it after the child process exits. This includes records emitted by
+`logging.shutdown` after the final exclusive summary writer. Each journal row
+binds the fresh execution nonce, and the journal shares the output size limit.
+Missing, changed, malformed or stale journals and incomplete summaries deny
+evidence.
 Only call-phase `AssertionError` at a declared test `assert`, missing expected
 exceptions at a declared `pytest.raises`, or explicit declared `pytest.fail`
 can be an assertion-failure candidate. Runtime exceptions, application-internal
