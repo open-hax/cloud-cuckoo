@@ -6,9 +6,11 @@ in its own process. The parent seals observed execution and an outer native CI
 collector must authenticate that producer artifact before qualification.
 """
 import ast
+import atexit
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -122,6 +124,7 @@ def pytest_collection_finish(session):
 def pytest_collectreport(report):
     if report.failed and _STATE is not None:
         _STATE['collection_errors'].append(report.nodeid)
+    _captured_stderr(report, 'collection')
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -150,6 +153,7 @@ def pytest_assertion_pass(item, lineno, orig, expl):
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    _captured_stderr(report, report.when)
     record = {'nodeid': item.nodeid, 'when': report.when, 'outcome': report.outcome,
               'exception_type': None, 'failure_kind': None, 'test_site': None}
     if call.excinfo is not None:
@@ -180,13 +184,56 @@ def pytest_warning_recorded(warning_message, when, nodeid, location):
 
 
 _WARNINGS = []
+_LOG_WARNINGS = []
 _STATE = None
+
+
+def _captured_stderr(report, phase):
+    value = getattr(report, 'capstderr', '')
+    if value:
+        _LOG_WARNINGS.append({'category': 'pytest.CapturedStderr',
+            'message_sha256': sha(value.encode()), 'when': phase, 'nodeid': report.nodeid})
+
+
+_RECORD_FACTORY = logging.getLogRecordFactory()
+
+
+def _observe_log_record(*args, **kwargs):
+    record = _RECORD_FACTORY(*args, **kwargs)
+    if record.levelno >= logging.WARNING:
+        # Preserve the logging record and application logging behavior. An
+        # observer must not turn a formatting failure into a different error.
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = 'unformattable logging record'
+        _LOG_WARNINGS.append({'category': 'logging.' + record.levelname,
+            'message_sha256': sha(message.encode()), 'when': 'process', 'nodeid': None})
+    return record
+
+
+logging.setLogRecordFactory(_observe_log_record)
+
+
+def _write_final_summary():
+    if _STATE is None:
+        return
+    # Registered before tests: their later atexit callbacks run before this
+    # final writer, so even a warning sent to NullHandler after pytest exits
+    # is observed. os._exit or an incomplete session still earns no credit.
+    _STATE['warnings'] = _WARNINGS + _LOG_WARNINGS
+    path = Path(os.environ['CLOUD_PYTEST_SUMMARY'])
+    with path.open('x') as target:
+        os.chmod(path, 0o600)
+        target.write(json.dumps(_STATE, sort_keys=True) + '\n')
+
+
+atexit.register(_write_final_summary)
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     state = session.config._evidence
-    state['warnings'] = _WARNINGS
     state['source_after'] = source_hashes(state['manifest'])
     state['exit_code'] = int(exitstatus)
     state['collection_failed'] = bool(state['collection_errors'])
@@ -207,7 +254,3 @@ def pytest_sessionfinish(session, exitstatus):
     # No exception text, assert operands, bearer token or protocol payload is
     # copied into this structured projection. Full raw streams stay private.
     del state['manifest']
-    path = Path(os.environ['CLOUD_PYTEST_SUMMARY'])
-    with path.open('x') as target:
-        os.chmod(path, 0o600)
-        target.write(json.dumps(state, sort_keys=True) + '\n')

@@ -257,3 +257,43 @@ def test_no_tests_never_becomes_a_clean_baseline(tmp_path):
     manifest['files']['tests/test_case.py'] = runner.sha(raw)
     result = runner.run_evidence(manifest, tmp_path / 'evidence')
     assert result['outcome'] == 'collection_error' and not result['assertion_failure'] and not result['clean_baseline']
+
+
+@pytest.mark.parametrize('phase', ['collection', 'setup', 'call', 'teardown'])
+def test_logged_warning_in_every_pytest_phase_denies_clean_baseline_and_kill(tmp_path, phase):
+    prefix, body, args = 'import logging\n', 'assert True', ''
+    if phase == 'collection':
+        prefix += 'logging.warning("synthetic collection warning")\n'
+    elif phase == 'call':
+        body = 'logging.warning("synthetic call warning")\nassert True'
+    else:
+        args = 'noisy'
+        prefix += ('@pytest.fixture\ndef noisy():\n' +
+            ('    logging.warning("synthetic setup warning")\n    return 1\n' if phase == 'setup'
+             else '    yield 1\n    logging.warning("synthetic teardown warning")\n'))
+    _, _, _, result = execute(tmp_path, body, prefix=prefix, args=args)
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert not result['clean_baseline'] and not result['assertion_failure']
+    assert any(w['category'] == 'logging.WARNING' for w in result['warnings'])
+
+
+def test_logged_warning_after_sessionfinish_is_observed_even_with_no_output_handler(tmp_path):
+    _, _, output, result = execute(tmp_path, '''
+        import atexit, logging
+        logger = logging.getLogger('synthetic-late-warning')
+        logger.propagate = False
+        logger.addHandler(logging.NullHandler())
+        atexit.register(lambda: logger.warning('synthetic late warning'))
+        assert True
+    ''')
+    assert (output / 'stderr.bin').stat().st_size == 0
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert any(w['category'] == 'logging.WARNING' for w in result['warnings'])
+    assert not result['clean_baseline'] and not result['assertion_failure']
+
+
+def test_unconsumed_pytest_captured_stderr_from_passing_test_denies_clean_baseline(tmp_path):
+    _, _, _, result = execute(tmp_path, 'import sys\nprint("synthetic diagnostic",file=sys.stderr)\nassert True')
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert any(w['category'] == 'pytest.CapturedStderr' for w in result['warnings'])
+    assert not result['clean_baseline'] and not result['assertion_failure']
