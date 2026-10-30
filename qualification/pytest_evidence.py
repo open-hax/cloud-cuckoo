@@ -207,8 +207,21 @@ def _observe_log_record(*args, **kwargs):
             message = record.getMessage()
         except Exception:
             message = 'unformattable logging record'
-        _LOG_WARNINGS.append({'category': 'logging.' + record.levelname,
-            'message_sha256': sha(message.encode()), 'when': 'process', 'nodeid': None})
+        observation = {'category': 'logging.' + record.levelname,
+            'message_sha256': sha(message.encode()), 'when': 'process', 'nodeid': None}
+        _LOG_WARNINGS.append(observation)
+        journal = os.environ.get('CLOUD_PYTEST_LOG_JOURNAL')
+        if journal:
+            # The parent creates this exclusive file and seals it only after
+            # process exit. logging.shutdown can run after the summary writer.
+            raw = encoded({'schema': 'cloud-pytest-log-record/v1',
+                'nonce': os.environ['CLOUD_PYTEST_NONCE'], **observation}) + b'\n'
+            descriptor = os.open(journal, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+            try:
+                with os.fdopen(descriptor, 'ab', closefd=False) as target:
+                    target.write(raw)
+            finally:
+                os.close(descriptor)
     return record
 
 

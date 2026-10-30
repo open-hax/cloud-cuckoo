@@ -297,3 +297,35 @@ def test_unconsumed_pytest_captured_stderr_from_passing_test_denies_clean_baseli
     assert result['outcome'] == 'warning_or_unstructured_stderr'
     assert any(w['category'] == 'pytest.CapturedStderr' for w in result['warnings'])
     assert not result['clean_baseline'] and not result['assertion_failure']
+
+
+def test_logging_shutdown_after_summary_cannot_supply_a_clean_baseline(tmp_path):
+    _, _, output, result = execute(tmp_path, '''
+        import logging
+        logger = logging.getLogger('synthetic-shutdown-warning')
+        logger.propagate = False
+        logger.addHandler(logging.NullHandler())
+        class WarningOnClose(logging.Handler):
+            def close(self):
+                logger.warning('synthetic warning after summary')
+                super().close()
+        keeper = WarningOnClose()
+        logging.getLogger('synthetic-kept-handler').addHandler(keeper)
+        assert True
+    ''')
+    assert (output / 'stderr.bin').stat().st_size == 0
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert any(w['category'] == 'logging.WARNING' for w in result['warnings'])
+    assert not result['clean_baseline'] and not result['assertion_failure']
+    journal = [json.loads(line) for line in (output / 'log-records.jsonl').read_text().splitlines()]
+    assert journal and all(row['nonce'] for row in journal)
+
+
+def test_changed_warning_journal_invalidates_parent_execution(tmp_path):
+    _, manifest, output, result = execute(tmp_path, 'assert True')
+    assert result['clean_baseline']
+    with (output / 'log-records.jsonl').open('ab') as target:
+        target.write(b'{}\n')
+    assessed = runner.assess(output, manifest, result['execution_sha256'])
+    assert assessed['outcome'] == 'evidence_error'
+    assert not assessed['clean_baseline'] and not assessed['assertion_failure']
