@@ -40,6 +40,7 @@ jobs:
         with:
           version: '0.9.5'
       - name: Test the current controller publication boundaries without credentials
+        working-directory: controller
         run: |
           mkdir -m 700 "$RUNNER_TEMP/controller-test-home"
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/controller-test-home" LANG=C.UTF-8 \
@@ -57,6 +58,7 @@ jobs:
             --archive "$RUNNER_TEMP/source.tar" --test-directory "$RUNNER_TEMP/source-tests" \
             --receipt "$RUNNER_TEMP/admission.json"
       - name: Test archived source without publishing or host credentials
+        working-directory: ${{ runner.temp }}/source-tests
         run: |
           mkdir -m 700 "$RUNNER_TEMP/test-home"
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
