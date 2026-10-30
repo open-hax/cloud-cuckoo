@@ -14,10 +14,12 @@ import json
 import logging
 import os
 from pathlib import Path
+import secrets
 import sys
 
 import pytest
 from _pytest.outcomes import Failed
+from expected_diagnostics import exception_snapshot, snapshot_is_exact
 
 
 def sha(raw):
@@ -56,7 +58,21 @@ def source_hashes(manifest):
 
 def producer_hashes():
     root = Path(__file__).resolve().parent
-    return {name: sha((root / name).read_bytes()) for name in ('pytest_evidence.py', 'run_pytest_evidence.py')}
+    return {name: sha((root / name).read_bytes()) for name in
+            ('pytest_evidence.py', 'run_pytest_evidence.py', 'expected_diagnostics.py')}
+
+
+def valid_diagnostic_site(manifest, site):
+    """Require a literal expect call in one declared, source-bound test file."""
+    if not isinstance(site, (tuple, list)) or len(site) != 2 or type(site[1]) is not int:
+        return False
+    path = relative_file(Path(manifest['root']), site[0])
+    declared = {name.split('::', 1)[0] for name in manifest['tests']}
+    if site[0] not in declared or sha(path.read_bytes()) != manifest['files'].get(site[0]):
+        return False
+    return any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+               and node.func.attr == 'expect' and node.lineno <= site[1] <= node.end_lineno
+               for node in ast.walk(ast.parse(path.read_text())))
 
 
 def valid_test_site(manifest, site, kind):
@@ -113,7 +129,7 @@ def pytest_configure(config):
         'manifest_sha256': sha(raw), 'manifest': manifest, 'producer_hashes': producer_hashes(),
         'runtime_identity': runtime_identity(), 'source_before': source_hashes(manifest),
         'pycache_prefix': str(cache), 'dont_write_bytecode': sys.dont_write_bytecode,
-        'collected': [], 'collection_errors': [], 'reports': [], 'warnings': [],
+        'collected': [], 'collection_errors': [], 'reports': [], 'warnings': [], 'expected_diagnostics': [],
         'assertion_passes': {'setup': 0, 'call': 0, 'teardown': 0}, 'complete': False}
     _STATE = config._evidence
 
@@ -137,8 +153,13 @@ def pytest_runtest_setup(item):
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_call(item):
+    global _ACTIVE_ITEM
     item._evidence_phase = 'call'
-    yield
+    _ACTIVE_ITEM = item
+    try:
+        yield
+    finally:
+        _ACTIVE_ITEM = None
 
 
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -189,13 +210,15 @@ def pytest_warning_recorded(warning_message, when, nodeid, location):
 _WARNINGS = []
 _LOG_WARNINGS = []
 _STATE = None
+_ACTIVE_ITEM = None
+_RECORDS = {}
 
 
 def _captured_stderr(report, phase):
     """Record unconsumed report diagnostics without copying their payload."""
     value = getattr(report, 'capstderr', '')
     if value:
-        _LOG_WARNINGS.append({'category': 'pytest.CapturedStderr',
+        _journal_diagnostic({'category': 'pytest.CapturedStderr',
             'message_sha256': sha(value.encode()), 'when': phase, 'nodeid': report.nodeid})
 
 
@@ -204,13 +227,12 @@ _MAKE_LOG_RECORD = logging.makeLogRecord
 _CAPTURE_READ = pytest.CaptureFixture.readouterr
 
 
-def _journal_diagnostic(observation):
-    """Append metadata to the exclusive file the parent seals after exit."""
-    _LOG_WARNINGS.append(observation)
+def _journal_event(event, payload):
+    """Append every observation/acknowledgement before the parent seals exit."""
     journal = os.environ.get('CLOUD_PYTEST_LOG_JOURNAL')
     if journal:
-        raw = encoded({'schema': 'cloud-pytest-log-record/v1',
-            'nonce': os.environ['CLOUD_PYTEST_NONCE'], **observation}) + b'\n'
+        raw = encoded({'schema': 'cloud-pytest-log-event/v2',
+            'nonce': os.environ['CLOUD_PYTEST_NONCE'], 'event': event, 'payload': payload}) + b'\n'
         descriptor = os.open(journal, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
         try:
             with os.fdopen(descriptor, 'ab', closefd=False) as target:
@@ -219,18 +241,85 @@ def _journal_diagnostic(observation):
             os.close(descriptor)
 
 
+def _journal_diagnostic(observation):
+    observation = {**observation, 'record_id': secrets.token_hex(16)}
+    _LOG_WARNINGS.append(observation)
+    _journal_event('observed', observation)
+    return observation
+
+
+def _origin_fields(record):
+    return {name: value if type(value) in (str, int, float, bool, type(None)) else None
+            for name in ('name', 'pathname', 'lineno', 'levelno', 'msg')
+            for value in (getattr(record, name, None),)}
+
+
+def _format_arguments(record):
+    primitive = lambda value: type(value) in (str, int, float, bool, type(None))
+    if type(record.args) is tuple and all(primitive(value) for value in record.args):
+        return {'positional': list(record.args)}
+    if type(record.args) is dict and all(type(key) is str and primitive(value) for key, value in record.args.items()):
+        return {'mapping': sorted(record.args.items())}
+    return {'opaque': True}
+
+
 def _observe_warning(record):
     """Hash primitive unformatted fields without invoking lazy arguments."""
     level = record.levelno
     # makeLogRecord first asks the factory for an uninitialized level=None
     # record. Its public wrapper observes the final reconstructed record.
     if type(level) in (int, float) and level >= logging.WARNING:
-        fields = {name: value if type(value) in (str, int, float, bool, type(None)) else None
-                  for name in ('name', 'pathname', 'lineno', 'levelno', 'msg')
-                  for value in (getattr(record, name, None),)}
+        fields = _origin_fields(record)
         category = 'WARNING' if level < logging.ERROR else 'ERROR' if level < logging.CRITICAL else 'CRITICAL'
-        _journal_diagnostic({'category': 'logging.' + category,
-            'message_sha256': sha(encoded(fields)), 'when': 'process', 'nodeid': None})
+        observation = _journal_diagnostic({'category': 'logging.' + category,
+            'message_sha256': sha(encoded(fields)), 'when': 'call' if _ACTIVE_ITEM else 'process',
+            'nodeid': _ACTIVE_ITEM.nodeid if _ACTIVE_ITEM else None})
+        info = record.exc_info
+        snapshot = ({'opaque': True} if info and (type(info) is not tuple or len(info) != 3)
+                    else exception_snapshot(info[1] if info else None))
+        _RECORDS[id(record)] = {'record': record, 'observation': observation, 'acknowledged': False,
+            'exception_info': info, 'exception_snapshot': snapshot, 'format_arguments': _format_arguments(record),
+            'message_is_primitive': type(record.msg) in (str, int, float, bool, type(None))}
+
+
+def acknowledge_expected(record, contract, site):
+    """Only the admitted helper can acknowledge a live record in its test call."""
+    import inspect
+    from expected_diagnostics import describe_record
+    caller = inspect.currentframe().f_back
+    try:
+        if Path(caller.f_code.co_filename).resolve() != Path(__file__).with_name('expected_diagnostics.py').resolve():
+            raise ValueError('Acknowledgement did not come from the admitted helper')
+    finally:
+        del caller
+    entry = _RECORDS.get(id(record))
+    if (_STATE is None or _ACTIVE_ITEM is None or entry is None or entry['record'] is not record
+            or entry['acknowledged'] or entry['observation']['nodeid'] != _ACTIVE_ITEM.nodeid
+            or entry['observation']['when'] != 'call'
+            or sha(encoded(_origin_fields(record))) != entry['observation']['message_sha256']
+            or not entry['message_is_primitive'] or not snapshot_is_exact(entry['format_arguments'])
+            or encoded(_format_arguments(record)) != encoded(entry['format_arguments'])
+            or record.exc_info is not entry['exception_info']
+            or not snapshot_is_exact(entry['exception_snapshot'])
+            or encoded(exception_snapshot(record.exc_info[1] if record.exc_info else None)) != encoded(entry['exception_snapshot'])
+            or describe_record(record) != contract):
+        raise ValueError('Diagnostic identity or exact contract differs')
+    root = Path(_STATE['manifest']['root'])
+    path = Path(site[0]).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError('Acknowledgement is outside admitted test source')
+    relative_site = [str(path.relative_to(root)), site[1]]
+    if (relative_site[0] != _ACTIVE_ITEM.nodeid.split('::', 1)[0]
+            or not valid_diagnostic_site(_STATE['manifest'], relative_site)):
+        raise ValueError('Acknowledgement test site differs')
+    acknowledgement = {'record_id': entry['observation']['record_id'],
+        'observation_sha256': sha(encoded(entry['observation'])),
+        'contract_sha256': sha(encoded(contract)), 'rendered_message_sha256': sha(contract['message'].encode()),
+        'exception_chain_sha256': sha(encoded(contract['exception'])),
+        'nodeid': _ACTIVE_ITEM.nodeid, 'when': 'call', 'test_site': relative_site}
+    _journal_event('acknowledged', acknowledgement)
+    _STATE['expected_diagnostics'].append(acknowledgement)
+    entry['acknowledged'] = True
 
 
 @functools.wraps(_RECORD_FACTORY)

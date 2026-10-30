@@ -27,7 +27,9 @@ async def serve(server):
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     app = server.http_app(stateless_http=True, json_response=True)
-    runner = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
+    # Retain standard pytest log capture rather than installing console
+    # handlers over it. The original error threshold remains unchanged.
+    runner = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on", log_config=None))
     task = asyncio.create_task(runner.serve(sockets=[sock]))
     try:
         for _ in range(200):
@@ -63,7 +65,7 @@ async def notebook_peer(ws):
         await ws.send(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}))
 
 
-async def test_real_http_and_official_browser_transport(tmp_path):
+async def test_real_http_and_official_browser_transport(tmp_path, diagnostics):
     bridge = BrowserBridge(tmp_path)
     async with serve(make_server(bridge, TOKEN)) as base:
         async with httpx.AsyncClient() as http:
@@ -80,6 +82,9 @@ async def test_real_http_and_official_browser_transport(tmp_path):
             assert "mcpProxyToken" not in json.dumps(status)
             result = await client.call_tool("colab_tools", {}, raise_on_error=False)
             assert result.is_error
+            diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                message="Error calling tool 'colab_tools'",
+                exception=ValueError('No Colab browser connected. Run the local open-browser command and accept the connection in Colab.'))
             connect = (await client.call_tool("colab_connect", {})).data
             assert "mcpProxyToken" not in json.dumps(connect)
         assert (tmp_path / "browser-url").stat().st_mode & 0o077 == 0
@@ -108,10 +113,20 @@ async def test_real_http_and_official_browser_transport(tmp_path):
                     assert output.content[0].text == "relay verified"
                     failure = await client.call_tool("colab_call", {"name": "fixture_echo", "arguments": {"text": "failure"}}, raise_on_error=False)
                     assert failure.is_error
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'", exception=ValueError("Error calling tool 'colab_call': Colab notebook tool failed: failure"))
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'", exception=ValueError('Colab notebook tool failed: failure'))
                     unknown = await client.call_tool("colab_call", {"name": "invented", "arguments": {}}, raise_on_error=False)
                     assert unknown.is_error
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'", exception=ValueError("Error calling tool 'colab_call': Unknown notebook tool. Call colab_tools and use an exact discovered name."))
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'", exception=ValueError('Unknown notebook tool. Call colab_tools and use an exact discovered name.'))
                     oversized = await client.call_tool("colab_call", {"name": "fixture_echo", "arguments": {"text": "x" * 262145}}, raise_on_error=False)
                     assert oversized.is_error
+                    diagnostics.expect(logger='fastmcp.tools.tool_manager', level=40,
+                        message="Error calling tool 'colab_call'", exception=ValueError('Arguments exceed 256 KiB; use a notebook-managed artifact instead'))
             await ws.close()
             await peer_task
         for _ in range(100):
