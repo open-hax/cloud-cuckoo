@@ -35,6 +35,24 @@ jobs:
           env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
             UV_CACHE_DIR="$RUNNER_TEMP/uv-cache" TMPDIR="$RUNNER_TEMP" \
             uv sync --frozen --extra test --python 3.13
+      - name: Check cold runtime imports without credentials
+        run: |
+          evidence="$RUNNER_TEMP/test-evidence/cold"
+          mkdir -m 700 "$evidence" "$evidence/python-cache"
+          (sudo systemd-run --quiet --wait --pipe --collect \
+            --unit="cloud-cuckoo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-cold" \
+            --uid="$(id -u)" --gid="$(id -g)" --working-directory="$GITHUB_WORKSPACE" \
+            --property=MemoryMax=2147483648 --property=MemorySwapMax=0 \
+            --property=CPUQuota=200% --property=TasksMax=128 --property=RuntimeMaxSec=120 \
+            /usr/bin/env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
+            PYTHONDONTWRITEBYTECODE=1 \
+            "$GITHUB_WORKSPACE/.venv/bin/python" -B -X "pycache_prefix=$evidence/python-cache" \
+            -W error -c 'import gc; import knoxx_colab_mcp.server; import knoxx_colab_mcp.oauth; import colab_mcp.websocket_server; import fastmcp.server.auth.providers.jwt; gc.collect()') \
+            > "$evidence/stdout.txt" 2> "$evidence/stderr.txt" || {
+              cat "$evidence/stdout.txt" "$evidence/stderr.txt"
+              exit 1
+            }
+          test ! -s "$evidence/stderr.txt" || { cat "$evidence/stderr.txt"; exit 1; }
       - name: Run adapter controls and the complete source suite with bounded resources
         run: |
           for phase in controls suite; do
@@ -50,7 +68,7 @@ jobs:
               /usr/bin/env -i PATH="$PATH" HOME="$RUNNER_TEMP/test-home" LANG=C.UTF-8 \
               PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
               "$GITHUB_WORKSPACE/.venv/bin/python" -B -X "pycache_prefix=$evidence/python-cache" \
-              -m pytest -q -p pytest_asyncio.plugin "$target" \
+              -m pytest -q -W error -p pytest_asyncio.plugin "$target" \
               --basetemp="$evidence/cases" --junitxml="$evidence/tests.xml") \
               > "$evidence/stdout.txt" 2> "$evidence/stderr.txt" || {
                 cat "$evidence/stdout.txt" "$evidence/stderr.txt"

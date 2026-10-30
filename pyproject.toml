@@ -5,8 +5,11 @@ description = "Authenticated HTTP boundary around Google's official browser Cola
 requires-python = ">=3.13"
 license = "GPL-3.0-or-later"
 dependencies = [
-  "colab-mcp @ git+https://github.com/googlecolab/colab-mcp@b9ab3899e0f1fa493390b1fd6d54aa2e464ecdf1",
-  "fastmcp==2.14.5",
+  "colab-mcp @ git+https://github.com/open-hax/colab-mcp@493fa290f7e9051000cb124b7cd5a55add18af50",
+  "fastmcp @ git+https://github.com/open-hax/fastmcp@ece14b78b0c44bc80ef7fe8c2955caa6bf5f6732",
+  "joserfc==1.7.7",
+  "Authlib==1.9.1",
+  "httpx2==2.16.0",
   "httpx>=0.28,<1",
 ]
 
@@ -22,6 +25,7 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.hatch.metadata]
 allow-direct-references = true

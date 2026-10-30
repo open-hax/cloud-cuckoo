@@ -17,7 +17,7 @@ import time
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from authlib.jose import JsonWebToken
+from joserfc import jwk, jwt
 from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
 from fastmcp.server.auth.auth import TokenHandler
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
@@ -244,7 +244,8 @@ class AxxiumOAuthProxy(OAuthProxy):
         # Verify the signature and fixed identities, but never use this path
         # for access or refresh. The mapping is prolonged before marking a
         # family pending, so it survives a crash without a separate index.
-        payload = JsonWebToken(["HS256"]).decode(token, self._jwt_signing_key)
+        payload = jwt.decode(token, jwk.import_key(self._jwt_signing_key, "oct"),
+                             algorithms=["HS256"]).claims
         if (payload.get("iss") != self.jwt_issuer.issuer or
                 payload.get("aud") != self.jwt_issuer.audience or
                 payload.get("client_id") != client_id or

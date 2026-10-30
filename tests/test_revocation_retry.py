@@ -10,6 +10,7 @@ from urllib.parse import parse_qs
 from fastmcp.server.auth.oauth_proxy import ClientCode
 import httpx
 import pytest
+from joserfc import jwk, jwt
 from mcp.server.auth.provider import TokenError
 
 import knoxx_colab_mcp.oauth as oauth
@@ -131,11 +132,13 @@ async def test_revocation_retry_survives_outage_and_restart(tmp_path, monkeypatc
             assert len(upstream_requests) == expected_calls
             # Validly signed tokens with the wrong issuer, audience or client,
             # and an invalid signature, cannot target this pending family.
-            original_claims = dict(auth.jwt_issuer._jwt.decode(tokens["access_token"], auth._jwt_signing_key))
+            key = jwk.import_key(auth._jwt_signing_key, "oct")
+            original_claims = dict(jwt.decode(tokens["access_token"], key, algorithms=["HS256"]).claims)
             headers = {"alg": "HS256", "typ": "JWT"}
-            invalid_tokens = [auth.jwt_issuer._jwt.encode(headers, {**original_claims, field: "wrong"}, auth._jwt_signing_key).decode()
+            invalid_tokens = [jwt.encode(headers, {**original_claims, field: "wrong"}, key, algorithms=["HS256"])
                               for field in ("iss", "aud", "client_id")]
-            invalid_tokens.append(auth.jwt_issuer._jwt.encode(headers, original_claims, b"x" * 32).decode())
+            invalid_tokens.append(jwt.encode(headers, original_claims, jwk.import_key(b"x" * 32, "oct"),
+                                             algorithms=["HS256"]))
             with monkeypatch.context() as m:
                 m.setattr(oauth, "httpx", SimpleNamespace(
                     AsyncClient=lambda **kw: factory(**kw, transport=httpx.MockTransport(unavailable)), HTTPError=httpx.HTTPError))
