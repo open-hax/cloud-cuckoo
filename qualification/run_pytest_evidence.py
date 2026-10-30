@@ -90,6 +90,7 @@ def _stop(process):
 
 
 def run_evidence(manifest, output, *, timeout=90, output_limit=16 * 1024 * 1024):
+    """Seal parent-observed streams and diagnostics after the child exits."""
     output = Path(output)
     require(timeout > 0 and output_limit > 0)
     output.mkdir(mode=0o700)
@@ -190,7 +191,8 @@ def assess(output, manifest, expected_execution_sha256):
         require(all(isinstance(row, dict)
                 and set(row) == {'schema', 'nonce', 'category', 'message_sha256', 'when', 'nodeid'}
                 and row['schema'] == 'cloud-pytest-log-record/v1' and row['nonce'] == envelope['nonce']
-                and isinstance(row['category'], str) and row['category'].startswith('logging.')
+                and isinstance(row['category'], str) and (row['category'].startswith('logging.')
+                    or row['category'] == 'pytest.CaptureFixtureStderr')
                 and isinstance(row['message_sha256'], str) and re.fullmatch('[0-9a-f]{64}', row['message_sha256'])
                 and row['when'] == 'process' and row['nodeid'] is None for row in logged))
         if not envelope['custody_before'] or not envelope['custody_after']:

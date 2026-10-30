@@ -261,6 +261,7 @@ def test_no_tests_never_becomes_a_clean_baseline(tmp_path):
 
 @pytest.mark.parametrize('phase', ['collection', 'setup', 'call', 'teardown'])
 def test_logged_warning_in_every_pytest_phase_denies_clean_baseline_and_kill(tmp_path, phase):
+    """Captured logs cannot qualify in any pytest execution phase."""
     prefix, body, args = 'import logging\n', 'assert True', ''
     if phase == 'collection':
         prefix += 'logging.warning("synthetic collection warning")\n'
@@ -278,6 +279,7 @@ def test_logged_warning_in_every_pytest_phase_denies_clean_baseline_and_kill(tmp
 
 
 def test_logged_warning_after_sessionfinish_is_observed_even_with_no_output_handler(tmp_path):
+    """A quiet handler cannot hide a warning emitted during process exit."""
     _, _, output, result = execute(tmp_path, '''
         import atexit, logging
         logger = logging.getLogger('synthetic-late-warning')
@@ -293,6 +295,7 @@ def test_logged_warning_after_sessionfinish_is_observed_even_with_no_output_hand
 
 
 def test_unconsumed_pytest_captured_stderr_from_passing_test_denies_clean_baseline(tmp_path):
+    """Passing assertions do not erase captured diagnostic output."""
     _, _, _, result = execute(tmp_path, 'import sys\nprint("synthetic diagnostic",file=sys.stderr)\nassert True')
     assert result['outcome'] == 'warning_or_unstructured_stderr'
     assert any(w['category'] == 'pytest.CapturedStderr' for w in result['warnings'])
@@ -300,6 +303,7 @@ def test_unconsumed_pytest_captured_stderr_from_passing_test_denies_clean_baseli
 
 
 def test_logging_shutdown_after_summary_cannot_supply_a_clean_baseline(tmp_path):
+    """The parent journal includes handlers closed after summary creation."""
     _, _, output, result = execute(tmp_path, '''
         import logging
         logger = logging.getLogger('synthetic-shutdown-warning')
@@ -322,6 +326,7 @@ def test_logging_shutdown_after_summary_cannot_supply_a_clean_baseline(tmp_path)
 
 
 def test_changed_warning_journal_invalidates_parent_execution(tmp_path):
+    """The assessor cannot consume a journal changed after parent sealing."""
     _, manifest, output, result = execute(tmp_path, 'assert True')
     assert result['clean_baseline']
     with (output / 'log-records.jsonl').open('ab') as target:
@@ -329,3 +334,54 @@ def test_changed_warning_journal_invalidates_parent_execution(tmp_path):
     assessed = runner.assess(output, manifest, result['execution_sha256'])
     assert assessed['outcome'] == 'evidence_error'
     assert not assessed['clean_baseline'] and not assessed['assertion_failure']
+
+
+@pytest.mark.parametrize('fixture', ['capsys', 'capfd', 'capsysbinary', 'capfdbinary'])
+def test_consumed_capture_stderr_remains_observed_without_changing_the_read(tmp_path, fixture):
+    """All four public capture fixtures retain their normal return value."""
+    _, _, output, result = execute(tmp_path, f'''
+        import sys
+        sys.stderr.write('synthetic consumed diagnostic')
+        captured = {fixture}.readouterr()
+        assert captured.err == {'b' if fixture.endswith('binary') else ''}'synthetic consumed diagnostic'
+        assert not {fixture}.readouterr().err
+    ''', args=fixture)
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert not result['clean_baseline'] and not result['assertion_failure']
+    assert any(row['category'] == 'pytest.CaptureFixtureStderr' for row in result['warnings'])
+    facts = json.loads((output/'summary.json').read_text())
+    assert all(row['outcome'] == 'passed' for row in facts['reports'])
+
+
+def test_null_handler_logging_does_not_format_lazy_arguments(tmp_path):
+    """The observer leaves argument formatting exclusively to handlers."""
+    _, _, output, result = execute(tmp_path, '''
+        import logging
+        calls = []
+        class Lazy:
+            def __str__(self):
+                calls.append('formatted')
+                return 'synthetic lazy argument'
+        logger = logging.getLogger('synthetic-lazy')
+        logger.propagate = False
+        logger.addHandler(logging.NullHandler())
+        logger.warning('%s', Lazy())
+        assert calls == []
+    ''')
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert all(row['outcome'] == 'passed' for row in json.loads((output/'summary.json').read_text())['reports'])
+
+
+def test_make_log_record_preserves_reconstruction_and_observes_final_warning(tmp_path):
+    """Factory level=None is valid before the supplied dictionary is applied."""
+    _, _, output, result = execute(tmp_path, '''
+        import logging
+        record = logging.makeLogRecord({'name': 'synthetic-receiver', 'levelno': logging.WARNING,
+            'levelname': 'WARNING', 'msg': 'synthetic reconstructed warning', 'args': (), 'lineno': 37})
+        assert record.levelno == logging.WARNING
+        assert record.lineno == 37
+        assert record.getMessage() == 'synthetic reconstructed warning'
+    ''')
+    assert result['outcome'] == 'warning_or_unstructured_stderr'
+    assert any(row['category'] == 'logging.WARNING' for row in result['warnings'])
+    assert all(row['outcome'] == 'passed' for row in json.loads((output/'summary.json').read_text())['reports'])
