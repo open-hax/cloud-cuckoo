@@ -22,7 +22,7 @@ Install `qualification/tools.lock` in a separate Python 3.13 environment with
 `uv pip install --require-hashes`. Native controls run with `-c /dev/null`
 because they test independent synthetic tool fixtures, without application
 pytest configuration. Native CI retains the actual source, hash lock, raw
-streams, JUnit report and synthetic fixture inputs. These five controls include
+streams, JUnit report and synthetic fixture inputs. These six controls include
 real native session creation and mutation materialization; they supply zero
 application test executions or qualification credit.
 
