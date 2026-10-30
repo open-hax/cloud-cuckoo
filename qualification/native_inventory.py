@@ -2,6 +2,7 @@
 """Freeze native Cosmic Ray proposals. This module never executes test jobs."""
 import argparse
 from collections import Counter
+from contextlib import closing
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -191,7 +192,7 @@ def freeze(root, source_sha, tool_lock, output):
         write_new(output / (operation + '.stderr'), process.stderr)
         require(process.returncode == 0 and not process.stderr, 'Native inventory command failed or warned')
     session = output / 'session.sqlite'
-    with sqlite3.connect('file:' + str(session) + '?mode=ro', uri=True) as database:
+    with closing(sqlite3.connect('file:' + str(session) + '?mode=ro', uri=True)) as database:
         require(database.execute('SELECT COUNT(*) FROM work_results').fetchone()[0] == 0,
                 'A native session already contains executed results')
     native = [json.loads(line) for line in (output / 'dump.stdout').read_bytes().splitlines()]
